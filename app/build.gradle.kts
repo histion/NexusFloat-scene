@@ -26,8 +26,10 @@ android {
         applicationId = "com.jj.nexusfloat"
         minSdk = 26
         targetSdk = 37
-        versionCode = 10811
-        versionName = "1.8.11"
+        // versionCode 只是给系统比大小的，跟 versionName 不必有换算关系；
+        // 这里取 8080809 是为了让它大于历史上的 10900，覆盖安装时能正常升级
+        versionCode = 8080809
+        versionName = "8.8.8.9"
     }
 
     signingConfigs {

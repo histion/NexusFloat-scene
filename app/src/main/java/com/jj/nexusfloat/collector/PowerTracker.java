@@ -15,11 +15,14 @@ import com.jj.nexusfloat.constant.Constants;
  * 次数上限的。数据源彻底失效就回到 0，不能锁死在一个假读数上。
  *
  * 这里不管正负号，符号由外部的充放电状态决定。
+ *
+ * v1.9.0 起把类和 resolve 都开成 public：统计侧的充电曲线要用同一套突变守卫，
+ * 否则监视条上电流被滤平了，充电记录里却还是那根尖刺，两边对不上。
  */
-final class PowerTracker {
+public final class PowerTracker {
 
     /** 惰性功率来源，真要用的时候才去调，省掉没必要的 sysfs 读取 */
-    interface Source {
+    public interface Source {
         /** 返回功率绝对值（W），读不到就 0 */
         float get();
     }
@@ -44,7 +47,7 @@ final class PowerTracker {
      *
      * 返回功率绝对值（W），没得用就返回 0。
      */
-    float resolve(float currentA, float voltageV, Source powerNow) {
+    public float resolve(float currentA, float voltageV, Source powerNow) {
         float power = fromCurrent(currentA, voltageV);
         if (power <= 0) {
             power = fromPowerNow(powerNow);

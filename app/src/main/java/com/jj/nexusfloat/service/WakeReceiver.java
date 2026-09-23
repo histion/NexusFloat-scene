@@ -6,6 +6,7 @@ import android.content.Intent;
 
 import com.jj.nexusfloat.collector.GpuCollectorWorker;
 import com.jj.nexusfloat.constant.Constants;
+import com.jj.nexusfloat.stats.StatsService;
 import com.jj.nexusfloat.utils.LogUtils;
 
 /**
@@ -36,5 +37,8 @@ public class WakeReceiver extends BroadcastReceiver {
         // GpuCollectorWorker 已经在跑，start() 会按需求把它拉起来
         GpuCollectorWorker.setOverlayDemand(true);
         GpuCollectorLauncher.startInProcess();
+        // 顺带把统计采样也接上（v1.9.0）：ColorOS 全部清除之后，这条唤醒链路是
+        // 模块进程唯一起得来的路，统计也走它一起恢复
+        StatsService.startIfEnabled(context);
     }
 }

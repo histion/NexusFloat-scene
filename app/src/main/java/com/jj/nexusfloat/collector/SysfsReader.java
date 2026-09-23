@@ -423,8 +423,12 @@ public final class SysfsReader {
      * 这由 Constants.Battery 里的区间常量保证。
      *
      * 返回换算后的值，解析不了就是 0。
+     *
+     * v8.8.8.8 起改成 public：统计侧（stats.BatterySampler）读电流必须跟监视条
+     * 用同一套单位判定。自己另写一套启发式（比如「除完小于 1 就当作 mA」）会在
+     * 内核本来就用 mA、数值又不小的机型上判错，两边读数就对不上了。
      */
-    static float parseScaled(String raw, float[] divisors, float min, float max) {
+    public static float parseScaled(String raw, float[] divisors, float min, float max) {
         if (raw == null) {
             return 0f;
         }

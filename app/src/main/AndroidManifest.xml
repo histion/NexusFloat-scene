@@ -17,6 +17,24 @@
     -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!--
+        统计采样要跨息屏、跨应用一直跑，只能靠前台服务（后台服务活不过几分钟）。
+        specialUse 类型没有时长上限；dataSync 从 Android 15 起一天只给 6 小时，
+        对「一直在记」的场景等于没有。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ 前台服务的通知要这个权限；不给也只是通知不显示，服务照跑 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        「使用情况访问」。统计页要靠它拿到精确的亮屏时长和逐应用前台时长。
+        这是设置里的开关，不是运行时弹窗；没授权时统计功能自动退回采样积分的估算值。
+    -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
     <application
         android:name=".App"
         android:allowBackup="true"
@@ -34,6 +52,24 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            充电与使用统计的采样服务（v1.9.0）。
+
+            foregroundServiceType 必须写 specialUse，并且配一条 subtype 属性说明用途：
+            Android 14 起前台服务必须声明类型，specialUse 还要求给出具体用途描述，
+            没有这条属性 startForeground 会直接抛异常。
+
+            exported=false：只由本应用自己启动，外部进程没必要也调不动它。
+        -->
+        <service
+            android:name=".stats.StatsService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="battery_charge_and_usage_statistics" />
+        </service>
 
         <provider
             android:name=".service.EarlyInitProvider"

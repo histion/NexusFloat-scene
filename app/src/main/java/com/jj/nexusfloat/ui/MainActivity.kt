@@ -1,12 +1,14 @@
 package com.jj.nexusfloat.ui
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -60,12 +62,15 @@ import com.jj.nexusfloat.collector.GpuRootReader
 import com.jj.nexusfloat.collector.SysfsReader
 import com.jj.nexusfloat.constant.Constants
 import com.jj.nexusfloat.service.GpuCollectorLauncher
+import com.jj.nexusfloat.stats.StatsRepository
+import com.jj.nexusfloat.stats.StatsService
 import com.jj.nexusfloat.ui.theme.*
 import com.jj.nexusfloat.utils.ExecUtils
 import com.jj.nexusfloat.utils.LogUtils
 import io.github.libxposed.service.XposedService
 import java.io.File
 import java.io.FileOutputStream
+import kotlinx.coroutines.launch
 
 /**
  * 模块主界面：用 Jetpack Compose (Material 3) 照着原来的 XML MaterialCardView 风格做的，
@@ -160,6 +165,16 @@ class MainActivity : ComponentActivity() {
     private var gpuUsageText by mutableStateOf("-- %")
     private var lastUpdateText by mutableStateOf("上次同步：从未")
 
+    // ---- 统计页（v1.9.0）----
+    /** 统计总开关，默认开：装了模块就是想看数据，默认关反而要多一步 */
+    private var statsEnabled by mutableStateOf(true)
+    /** 采样间隔（秒） */
+    private var statsIntervalSec by mutableStateOf(Constants.Stats.INTERVAL_DEFAULT_SEC)
+    /** 常驻通知开关 */
+    private var statsNotification by mutableStateOf(true)
+    /** 只在亮屏时记录 */
+    private var statsScreenOnOnly by mutableStateOf(false)
+
     /** 版本号从 PackageManager 取，免得依赖 BuildConfig（AGP 默认不生成它了） */
     private val versionName: String by lazy {
         try {
@@ -227,6 +242,20 @@ class MainActivity : ComponentActivity() {
         loadFpsSourceFlags()
         sfPreferRoot = readSwitch(Constants.Modules.KEY_SF_PREFER_ROOT, default = false)
         fpsDebug = readSwitch(Constants.Modules.KEY_FPS_DEBUG, default = false)
+        // 统计页的四项设置。默认值跟 StatsService.startIfEnabled 保持一致：
+        // 那边默认开，这边要是默认关，界面显示的状态就和实际跑的对不上
+        statsEnabled = readSwitch(Constants.Stats.KEY_ENABLED, default = true)
+        statsIntervalSec = readInt(
+            Constants.Stats.KEY_INTERVAL_SEC,
+            Constants.Stats.INTERVAL_DEFAULT_SEC
+        ).coerceIn(Constants.Stats.INTERVAL_MIN_SEC, Constants.Stats.INTERVAL_MAX_SEC)
+        statsNotification = readSwitch(Constants.Stats.KEY_NOTIFICATION, default = true)
+        statsScreenOnOnly = readSwitch(Constants.Stats.KEY_SCREEN_ON_ONLY, default = false)
+        // 统计功能开着就确保采样服务在跑：用户可能是从桌面图标进来的，
+        // 进程刚起来，服务未必已经拉起
+        if (statsEnabled) {
+            StatsService.startIfEnabled(this)
+        }
         appTheme = readInt(Constants.Modules.KEY_APP_THEME, Constants.Modules.APP_THEME_SYSTEM)
         loadModuleOrder()
         uiWallpaperName = readString(Constants.Modules.KEY_UI_WALLPAPER, "")
@@ -426,7 +455,23 @@ class MainActivity : ComponentActivity() {
                             onSpaceBeforeCommit = { commitSpaceBefore(it) },
                             xposedConnected = xposedConnected,
                             lastUpdateText = lastUpdateText,
-                            versionName = versionName
+                            versionName = versionName,
+                            statsEnabled = statsEnabled,
+                            onStatsEnabledChange = { applyStatsEnabled(it) },
+                            statsIntervalSec = statsIntervalSec,
+                            onStatsIntervalChange = { changeStatsInterval(it) },
+                            statsNotification = statsNotification,
+                            onStatsNotificationChange = { checked ->
+                                statsNotification = checked
+                                saveSwitch(Constants.Stats.KEY_NOTIFICATION, checked)
+                            },
+                            statsScreenOnOnly = statsScreenOnOnly,
+                            onStatsScreenOnOnlyChange = { checked ->
+                                statsScreenOnOnly = checked
+                                saveSwitch(Constants.Stats.KEY_SCREEN_ON_ONLY, checked)
+                            },
+                            onOpenUsageAccess = { openUsageAccessSettings() },
+                            onClearStats = { clearStats() }
                         )
                     }
                 }
@@ -457,6 +502,89 @@ class MainActivity : ComponentActivity() {
         Thread {
             val out = ExecUtils.exec("killall com.android.systemui || pkill -f com.android.systemui")
             LogUtils.i("Restart SystemUI result: $out")
+        }.start()
+    }
+
+    // ======================= 统计页（v1.9.0）=======================
+
+    /**
+     * 统计总开关。
+     *
+     * 打开时顺手起服务、关闭时停服务：开关状态本身存在 prefs 里，
+     * 但「服务现在在不在跑」不能等下一次开机或下一次重启进程才对上。
+     * 采样服务不在跑的时候，采样循环也会随 onDestroy 停掉。
+     *
+     * 方法名不叫 setStatsEnabled：那样会跟 statsEnabled 这个属性自动生成的
+     * setter 撞上同一个 JVM 签名，编译器直接报 platform declaration clash。
+     */
+    private fun applyStatsEnabled(enabled: Boolean) {
+        statsEnabled = enabled
+        saveSwitch(Constants.Stats.KEY_ENABLED, enabled)
+        if (enabled) {
+            StatsService.startIfEnabled(this)
+            Toast.makeText(this, "已开启统计，正在记录充电与使用情况", Toast.LENGTH_SHORT).show()
+        } else {
+            StatsService.stop(this)
+            Toast.makeText(this, "已停止统计，历史数据仍然保留", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 调采样间隔。
+     *
+     * 夹到合法区间之后回写，界面上的数字立刻跟着变。采样循环每次 tick 都重新
+     * 读一次间隔，所以改完不用重启服务，下一拍就按新间隔走。
+     */
+    private fun changeStatsInterval(delta: Int) {
+        val next = (statsIntervalSec + delta * Constants.Stats.INTERVAL_STEP_SEC)
+            .coerceIn(Constants.Stats.INTERVAL_MIN_SEC, Constants.Stats.INTERVAL_MAX_SEC)
+        if (next == statsIntervalSec) {
+            // 已经顶到边界了，给个提示，免得用户以为按钮坏了
+            Toast.makeText(
+                this,
+                if (delta > 0) "最长 ${Constants.Stats.INTERVAL_MAX_SEC} 秒"
+                else "最短 ${Constants.Stats.INTERVAL_MIN_SEC} 秒",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        statsIntervalSec = next
+        saveInt(Constants.Stats.KEY_INTERVAL_SEC, next)
+    }
+
+    /**
+     * 跳系统「使用情况访问」设置页。
+     *
+     * 这个权限没有运行时申请接口，只能把用户送到设置页自己打开。
+     * 直接 startActivity 可能抛 ActivityNotFoundException（部分精简 ROM 裁了这个页面），
+     * 那就退回设置首页，别让应用崩在这。
+     */
+    private fun openUsageAccessSettings() {
+        val direct = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+        direct.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(direct)
+        } catch (e: Exception) {
+            LogUtils.w("open usage access settings failed, fallback to app details", e)
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e2: Exception) {
+                Toast.makeText(this, "打不开系统设置，请手动到「设置 → 应用 → 特殊权限」里授权", Toast.LENGTH_LONG)
+                    .show()
+            }
+        }
+    }
+
+    /** 清空统计数据。跑在后台线程，几千行删除不该卡住点按的那一下 */
+    private fun clearStats() {
+        Toast.makeText(this, "正在清空统计数据…", Toast.LENGTH_SHORT).show()
+        Thread {
+            StatsRepository.clearAll(applicationContext)
+            mainHandler.post {
+                Toast.makeText(this, "统计数据已清空", Toast.LENGTH_SHORT).show()
+            }
         }.start()
     }
 
@@ -1052,10 +1180,15 @@ class MainActivity : ComponentActivity() {
  * 原先所有卡片都堆在一个长滚动页里，从「显示时机」翻到「外观与校正」要划过
  * 十个项目开关。按用途拆成三页：一页看状态和何时显示，一页调监视项目和外观，
  * 一页放帧率来源这类调完基本不再动的设置。
+ *
+ * v1.9.0 加了第四页「统计」：充电曲线和使用统计都是成块的数据，塞进任何一页
+ * 都会把原来的东西挤出屏幕，值得单独给一页。
  */
 private enum class MainTab(val title: String, val icon: String) {
     /** 运行状态 + 显示时机 + 维护 + 使用须知：打开 App 最先要确认的几件事 */
     STATUS("状态", "◉"),
+    /** 充电曲线 + 使用统计 + 设置：数据都是只读的看板，跟「调开关」分开放 */
+    STATS("统计", "▤"),
     /** 监视项目 + 外观与校正：「显示什么」和「长什么样」搁一起才顺手 */
     MODULES("项目", "☰"),
     /** FPS 来源：六个开关加预设，独占一页 */
@@ -1126,9 +1259,23 @@ fun MainScreen(
     onSpaceBeforeCommit: (String) -> Unit,
     xposedConnected: Boolean,
     lastUpdateText: String,
-    versionName: String
+    versionName: String,
+    // ---- 统计页（v1.9.0）----
+    statsEnabled: Boolean,
+    onStatsEnabledChange: (Boolean) -> Unit,
+    statsIntervalSec: Int,
+    onStatsIntervalChange: (Int) -> Unit,
+    statsNotification: Boolean,
+    onStatsNotificationChange: (Boolean) -> Unit,
+    statsScreenOnOnly: Boolean,
+    onStatsScreenOnOnlyChange: (Boolean) -> Unit,
+    onOpenUsageAccess: () -> Unit,
+    onClearStats: () -> Unit
 ) {
     var tab by rememberSaveable { mutableStateOf(MainTab.STATUS) }
+    // 只用来响应「把统计页滚回顶部」：记录详情是在统计页里就地替换内容的二级视图，
+    // 而滚动状态在这一层，所以得由这里代劳
+    val scope = rememberCoroutineScope()
 
     Column(modifier = modifier) {
         // 每页各自滚动：key(tab) 让每页拿到独立的 ScrollState，切页后回到该页顶部。
@@ -1185,8 +1332,29 @@ fun MainScreen(
                     ChangelogCard()
                 }
 
-                MainTab.MODULES -> {
-                    ModulesCard(
+                // 统计页自成一屏：它自己会拉数据、自己定时刷新，
+                // 所以这里不接收任何实时读数，只把设置项和两个动作递进去
+                MainTab.STATS -> StatsScreen(
+                    statsEnabled = statsEnabled,
+                    onStatsEnabledChange = onStatsEnabledChange,
+                    intervalSec = statsIntervalSec,
+                    onIntervalChange = onStatsIntervalChange,
+                    notificationEnabled = statsNotification,
+                    onNotificationChange = onStatsNotificationChange,
+                    screenOnOnly = statsScreenOnOnly,
+                    onScreenOnOnlyChange = onStatsScreenOnOnlyChange,
+                    // 双电芯开关跟「监视项目」页共用同一份状态和同一个 prefs 键，
+                    // 两页的开关永远一致；统计页的数字会跟着立即缩放
+                    dualCellEnabled = dualCellEnabled,
+                    onDualCellChange = onDualCellChange,
+                    onOpenUsageAccess = onOpenUsageAccess,
+                    onClearData = onClearStats,
+                    // 进/出记录详情时把整页滚回顶部，否则从历史列表中间那条点进去，
+                    // 会直接落在详情页的中段，看着像内容错位
+                    onRequestScrollTop = { scope.launch { scrollState.scrollTo(0) } }
+                )
+
+                MainTab.MODULES -> {                    ModulesCard(
                         moduleFlags = moduleFlags,
                         onModuleChange = onModuleChange,
                         moduleNames = moduleNames,
@@ -1327,30 +1495,39 @@ fun HeaderCard(
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "酷安@叶落雨巷",
+                        text = "酷安@histion自改自用",
                         fontSize = 13.sp,
                         color = MdThemeOnSurfaceVariant
                     )
                     Text(
-                        text = "Github@YeLuoYuXiang",
+                        text = "Github@histion",
                         fontSize = 13.sp,
                         color = MdThemeOnSurfaceVariant
                     )
                 }
-                if (versionName.isNotEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(MdThemeSurface)
-                            .padding(horizontal = 10.dp, vertical = 5.dp)
-                    ) {
-                        Text(
-                            text = "v$versionName",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MdThemePrimary
-                        )
+                // 版本号徽章和原作者署名竖排靠右：署名放在版本号正下方
+                Column(horizontalAlignment = Alignment.End) {
+                    if (versionName.isNotEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(MdThemeSurface)
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                        ) {
+                            Text(
+                                text = "v$versionName",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MdThemePrimary
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(5.dp))
                     }
+                    Text(
+                        text = "原作者：酷安@叶落雨巷",
+                        fontSize = 11.sp,
+                        color = MdThemeOnSurfaceVariant
+                    )
                 }
             }
 
@@ -1396,7 +1573,7 @@ fun HeaderCard(
 
 /** 卡片外壳：统一圆角、描边和内边距，再带个小标题 */
 @Composable
-private fun SectionCard(
+internal fun SectionCard(
     title: String,
     content: @Composable ColumnScope.() -> Unit
 ) {
@@ -1441,7 +1618,7 @@ private fun SectionCard(
  * name 非 null 时在名称和开关之间插一个监视条名称输入框，onNameChange 与它成对提供。
  */
 @Composable
-private fun ToggleRow(
+internal fun ToggleRow(
     label: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
@@ -1999,24 +2176,27 @@ private fun PresetRow(
  * v1.6.6 起用于主题切换（浅色 / 深色 / 跟随系统）。
  */
 @Composable
-private fun SegmentedSelector(
+internal fun SegmentedSelector(
     options: List<String>,
     selectedIndex: Int,
-    onSelect: (Int) -> Unit
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    /** 紧凑模式：统计页拿它当排序切换用，字号和内边距都要小一号才塞得进一行 */
+    compact: Boolean = false
 ) {
-    val shape = RoundedCornerShape(14.dp)
+    val shape = RoundedCornerShape(if (compact) 10.dp else 14.dp)
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clip(shape)
             .background(ToggleOffContainer)
             .border(1.dp, CardStroke, shape)
-            .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
+            .padding(if (compact) 3.dp else 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 4.dp)
     ) {
         options.forEachIndexed { index, label ->
             val selected = index == selectedIndex
-            val itemShape = RoundedCornerShape(11.dp)
+            val itemShape = RoundedCornerShape(if (compact) 8.dp else 11.dp)
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -2033,12 +2213,12 @@ private fun SegmentedSelector(
                         role = Role.RadioButton,
                         onValueChange = { if (it) onSelect(index) }
                     )
-                    .padding(vertical = 10.dp),
+                    .padding(vertical = if (compact) 5.dp else 10.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = label,
-                    fontSize = 14.sp,
+                    fontSize = if (compact) 10.sp else 14.sp,
                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
                     color = if (selected) MdThemeOnPrimaryContainer else MdThemeOnSurfaceVariant
                 )
@@ -2525,7 +2705,7 @@ fun StatusCard(
 
 /** 一块读数：小标题 + 大字数值 */
 @Composable
-private fun MetricTile(
+internal fun MetricTile(
     title: String,
     value: String,
     modifier: Modifier = Modifier
@@ -2616,6 +2796,21 @@ private data class ChangelogEntry(val version: String, val summary: String)
  * shell 内建 read）只在能被观察到时才写进来，那一条的观察点是耗电。
  */
 private val CHANGELOG = listOf(
+    ChangelogEntry(
+        "8.8.8.9",
+        "新增「统计」页：充电记录、使用周期、应用使用情况榜、累计统计，数据存本机、永久保留。" +
+                "充电记录和使用周期历史都能点进去看那一次的明细：充电详情有起止时间、充入电量、" +
+                "平均/峰值功率、温度、充电速度和电量—功率曲线；使用周期详情有亮屏/待机、电量消耗、" +
+                "耗电估算、平均功耗和耗电曲线。" +
+                "使用过程的曲线里叠了一条「应用图标塔」——每一列是一个时段，格子是那段时间在前台的" +
+                "应用，柱子越高说明用得越多，电量曲线压在塔上，什么时候在用、在用什么、还剩多少电" +
+                "一眼看清。应用榜给出每个应用的平均功率、消耗的毫安数和占整机耗电的百分比。" +
+                "新增「双电芯（功率 ×2）」开关，和监视项目页共用同一个设置，双电芯机型不再只显示" +
+                "一半功率；常驻通知、统计页、悬浮窗三处读数一致。" +
+                "历史列表里逐条可删，进行中的那条显示为「重置」。" +
+                "修复功率与电流读不到、充电功率曲线不动，修复采样间隔加减按钮一点就跳到上限。" +
+                "去掉状态页里没用的「屏幕 亮/灭」换成实时功率，标题卡补上原作者署名。"
+    ),
     ChangelogEntry(
         "1.8.11",
         "修复 ColorOS「全部清除后台」后 GPU 数据停更：定时发一条广播把模块进程" +

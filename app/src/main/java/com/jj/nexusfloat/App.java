@@ -4,6 +4,7 @@ import android.app.Application;
 
 import com.jj.nexusfloat.bridge.NexusRemoteWriter;
 import com.jj.nexusfloat.collector.GpuCollectorWorker;
+import com.jj.nexusfloat.stats.StatsService;
 
 import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.XposedServiceHelper;
@@ -30,6 +31,11 @@ public class App extends Application implements XposedServiceHelper.OnServiceLis
         // 本地写入通道要 Context，而且必须赶在采集线程起来之前
         NexusRemoteWriter.bind(this);
         XposedServiceHelper.registerListener(this);
+
+        // 统计采样（v1.9.0）。放在这里而不是等界面打开：进程可能是被开机广播或者
+        // SystemUI 的唤醒广播拉起来的，那些场景下用户根本不会看到界面，但采样得接上。
+        // 失败也不管——Android 12+ 有些时机不允许启动前台服务，用户下次打开 App 会再试
+        StatsService.startIfEnabled(this);
     }
 
     /** Xposed 服务绑上了 → Remote 通道可用，顺便确认一下采集在跑 */
@@ -38,7 +44,6 @@ public class App extends Application implements XposedServiceHelper.OnServiceLis
         xposedService = service;
         GpuCollectorWorker.start();
     }
-
     /**
      * 服务断开只把引用清掉，采集不停：本地通道还能用，
      * 停掉的话 SystemUI 那边的 GPU 数据就凭空没了。

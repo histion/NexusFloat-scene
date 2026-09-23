@@ -5,7 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 
 import com.jj.nexusfloat.collector.GpuCollectorWorker;
-import com.jj.nexusfloat.constant.Constants;
+import com.jj.nexusfloat.stats.StatsService;
 import com.jj.nexusfloat.utils.LogUtils;
 
 /**
@@ -40,5 +40,8 @@ public class BootReceiver extends BroadcastReceiver {
         GpuCollectorLauncher.startInProcess();
         // 见类注释：先采着，SystemUI 的 pause 心跳会把它停回去
         GpuCollectorWorker.setOverlayDemand(true);
+        // 统计采样（v1.9.0）：开机就要接上，不然重启前后的充电会话会被切成两段。
+        // specialUse 类型不在「开机广播不准启动前台服务」的限制名单里
+        StatsService.startIfEnabled(context);
     }
 }
