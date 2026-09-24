@@ -446,7 +446,8 @@ private fun PeriodDetailBody(
             leftMin = 0f,
             leftMax = 100f,
             leftFormat = { "${it.toInt()}%" },
-            xLabels = axisLabels(times),
+            leftStep = 20f,
+            xTicks = axisTicks(times, X_TICK_USAGE_MS),
             xValues = times,
             appTower = tower
         )

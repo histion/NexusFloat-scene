@@ -414,6 +414,15 @@ public final class Constants {
         /** 双电芯开着的时候功率和电流的倍率 */
         public static final float DUAL_CELL_MULTIPLIER = 2f;
 
+        /**
+         * 「退出后隐藏最近任务卡片」；默认关。
+         *
+         * 这一条只影响本 App 自己的界面行为（最近任务列表里要不要留卡片），
+         * SystemUI 侧完全用不到，所以不像其它开关那样下发 RemotePreferences。
+         */
+        public static final String KEY_HIDE_RECENTS_ON_EXIT = "hide_recents_on_exit";
+        public static final String LABEL_HIDE_RECENTS_ON_EXIT = "退出后隐藏最近任务卡片";
+
         /** 字体大小（sp），App 界面上用加减按钮调 */
         public static final String KEY_FONT_SIZE = "font_size_sp";
         public static final String LABEL_FONT_SIZE = "字体大小";

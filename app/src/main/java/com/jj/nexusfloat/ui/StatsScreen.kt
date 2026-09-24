@@ -1,10 +1,13 @@
 package com.jj.nexusfloat.ui
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas as AndroidCanvas
 import android.graphics.drawable.Drawable
+import android.os.BatteryManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
@@ -143,6 +146,18 @@ fun StatsScreen(
     ) {
         value = withContext(Dispatchers.IO) { StatsRepository.load(context) }
     }
+
+    /**
+     * 现在是不是插着电（「仅亮屏时记录」的临时状态要用）。
+     *
+     * 直接读电池的粘性广播，不复用采样数据：采样点默认 15 秒一个，统计整个关掉时
+     * 更是一个都没有，而设置卡上那个开关要在插上电的瞬间就显示成「已自动关闭」。
+     * 粘性广播是系统缓存的一份，读它不耗电、也不用注册接收器。
+     *
+     * 跟着 refreshTick 重读：统计页本来就在 5 秒刷一次，插拔电源最迟 5 秒内反映到
+     * 开关上；页面切走时 LaunchedEffect 停了，这里也不会再读。
+     */
+    val chargingNow = remember(refreshTick) { readChargingNow(context) }
 
     // 删单条记录：删除是几百行的 DELETE，不能放在主线程；删完把 refreshTick 往前
     // 推一格，produceState 会重新装一屏数据，列表里那条立刻消失。
@@ -302,6 +317,9 @@ fun StatsScreen(
         onNotificationChange = onNotificationChange,
         screenOnOnly = screenOnOnly,
         onScreenOnOnlyChange = onScreenOnOnlyChange,
+        // 充电中这个开关会自动置为「关」，拔电后恢复用户原本的选择。恢复不需要
+        // 额外做什么——用户存下来的值从头到尾没被改写，这里只是「显示成关」
+        charging = chargingNow,
         dualCellEnabled = dualCellEnabled,
         onDualCellChange = onDualCellChange,
         usagePermission = data.usagePermission,
@@ -346,30 +364,21 @@ private fun CurrentStatusCard(data: StatsRepository.Dashboard) {
                 modifier = Modifier.padding(bottom = 6.dp, start = 2.dp)
             )
             Spacer(modifier = Modifier.width(14.dp))
-            Column(modifier = Modifier.padding(bottom = 6.dp)) {
-                Text(
-                    text = if (latest.charging()) "充电中" else "使用中",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (latest.charging()) ChargeColor else MdThemeOnSurface
-                )
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = buildString {
-                        append(String.format(Locale.US, "%.1f W", Math.abs(latest.powerW)))
-                        if (latest.voltageMv > 0) {
-                            append(String.format(Locale.US, " · %.2f V", latest.voltageMv / 1000f))
-                        }
-                        append(String.format(Locale.US, " · %.1f°C", latest.tempC))
-                    },
-                    fontSize = 11.sp,
-                    color = MdThemeOnSurfaceVariant
-                )
-            }
+            // 「使用中 / 充电中」这行原来下面还挂着一行小字（功率 · 电压 · 温度）。
+            // 三个读数现在都在下面的卡片里各有格子，这里再写一遍只会把主数字挤小，
+            // 所以只留状态本身（v8.8.9.3）
+            Text(
+                text = if (latest.charging()) "充电中" else "使用中",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (latest.charging()) ChargeColor else MdThemeOnSurface,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
         }
 
         Spacer(modifier = Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // 一行四个格子，每格只剩七十来 dp，所以用 compact 把内边距和字号收一档
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             MetricTile(
                 title = "电流",
                 value = if (latest.currentAbsMa() > 0) {
@@ -377,6 +386,19 @@ private fun CurrentStatusCard(data: StatsRepository.Dashboard) {
                 } else {
                     "-- mA"
                 },
+                compact = true,
+                modifier = Modifier.weight(1f)
+            )
+            // 电压原来缩在「充电中/使用中」下面那行小字里，它跟电流、功率是同一组
+            // 电学量，单独给一格比挤在状态行里清楚（v8.8.9.3）
+            MetricTile(
+                title = "电压",
+                value = if (latest.voltageMv > 0) {
+                    String.format(Locale.US, "%.2f V", latest.voltageMv / 1000f)
+                } else {
+                    "-- V"
+                },
+                compact = true,
                 modifier = Modifier.weight(1f)
             )
             // 原来是「屏幕 亮/灭」。用户打开这个页面本身就意味着屏幕是亮的，
@@ -388,11 +410,13 @@ private fun CurrentStatusCard(data: StatsRepository.Dashboard) {
                 } else {
                     "-- W"
                 },
+                compact = true,
                 modifier = Modifier.weight(1f)
             )
             MetricTile(
                 title = "电池温度",
                 value = String.format(Locale.US, "%.1f°C", latest.tempC),
+                compact = true,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -509,6 +533,11 @@ private fun ChargeCard(
     }
 }
 
+/** 充电曲线的横轴刻度间隔：10 分钟 */
+internal const val X_TICK_CHARGE_MS = 10L * 60_000L
+/** 使用曲线的横轴刻度间隔：6 小时 */
+internal const val X_TICK_USAGE_MS = 6L * 3600_000L
+
 /**
  * 充电曲线：电量走左轴（0–100%），功率走右轴。
  *
@@ -524,9 +553,10 @@ internal fun ChargeCurves(curve: List<StatsStore.Sample>) {
     val levels = curve.map { it.level.toFloat() }
     val powers = curve.map { Math.abs(it.powerW) }
 
-    // 功率轴上限取实际峰值的 1.15 倍并向上取整到 5W，免得曲线贴着顶边
+    // 功率轴上限取实际峰值的 1.15 倍并向上取整到 10W，免得曲线贴着顶边；
+    // 右轴刻度每 10W 一条，上限不是 10 的整数倍时最上面那条刻度对不上峰值
     val peak = powers.maxOrNull() ?: 0f
-    val powerMax = maxOf(5f, Math.ceil((peak * 1.15f / 5f).toDouble()).toFloat() * 5f)
+    val powerMax = maxOf(10f, Math.ceil((peak * 1.15f / 10f).toDouble()).toFloat() * 10f)
 
     val times = curve.map { it.ts }
     LineChart(
@@ -546,7 +576,9 @@ internal fun ChargeCurves(curve: List<StatsStore.Sample>) {
         showRightAxis = true,
         leftFormat = { "${it.toInt()}%" },
         rightFormat = { if (it >= 10f) it.toInt().toString() else String.format(Locale.US, "%.1f", it) },
-        xLabels = axisLabels(times),
+        leftStep = 20f,
+        rightStep = 10f,
+        xTicks = axisTicks(times, X_TICK_CHARGE_MS),
         xValues = times
     )
 
@@ -566,7 +598,7 @@ internal fun ChargeCurves(curve: List<StatsStore.Sample>) {
         leftMin = tempMin,
         leftMax = if (tempMax - tempMin < 2f) tempMin + 2f else tempMax,
         leftFormat = { "${it.toInt()}°" },
-        xLabels = axisLabels(times),
+        xTicks = axisTicks(times, X_TICK_CHARGE_MS),
         xValues = times
     )
 }
@@ -693,7 +725,8 @@ private fun UsageCard(
                 leftMin = 0f,
                 leftMax = 100f,
                 leftFormat = { "${it.toInt()}%" },
-                xLabels = axisLabels(times),
+                leftStep = 20f,
+                xTicks = axisTicks(times, X_TICK_USAGE_MS),
                 xValues = times,
                 // 图标塔并进同一张图：塔立在绘图区底线上，电量曲线压在塔上面
                 appTower = tower
@@ -1234,6 +1267,8 @@ private fun StatsSettingsCard(
     onNotificationChange: (Boolean) -> Unit,
     screenOnOnly: Boolean,
     onScreenOnOnlyChange: (Boolean) -> Unit,
+    /** 当前是否插着电；插着电时「仅亮屏时记录」自动关闭并置灰 */
+    charging: Boolean,
     dualCellEnabled: Boolean,
     onDualCellChange: (Boolean) -> Unit,
     usagePermission: Boolean,
@@ -1269,11 +1304,29 @@ private fun StatsSettingsCard(
             description = "关掉只是不显示；前台服务本身需要它保活"
         )
         Spacer(modifier = Modifier.height(8.dp))
+        // 「仅亮屏时记录」在充电期间自动关闭（v8.8.9.3）。
+        //
+        // 理由：插着电本来就谈不上省电，而这个开关开着会让整夜充电的曲线只剩零星
+        // 几个点（采样侧同样把充电排除在外，见 BatterySampler#skipByScreenOnly）。
+        // 这里是把那条规则**显示出来**：充电中这一行显示成「关」且不可点，副标题
+        // 说明拔电后会自动恢复。
+        //
+        // 恢复不需要额外做什么——用户存下来的值从头到尾没被改写。真去「先存原值、
+        // 改掉、充电完再写回来」的话，进程一旦在充电中途被杀，用户的选择就永久丢了。
         ToggleRow(
             label = "仅亮屏时记录",
-            checked = screenOnOnly,
+            checked = screenOnOnly && !charging,
             onCheckedChange = onScreenOnOnlyChange,
-            description = "更省电，但息屏期间的电量曲线会断开"
+            enabled = !charging,
+            description = if (charging) {
+                if (screenOnOnly) {
+                    "充电中已自动关闭（插着电本来就全量记录），拔电后恢复为「开」"
+                } else {
+                    "充电中不适用（插着电本来就全量记录）"
+                }
+            } else {
+                "更省电，但息屏期间的电量曲线会断开"
+            }
         )
         // 双电芯跟监视条共用同一个开关（读写的是同一个 prefs 键），
         // 拨完这一页的数字立刻翻倍/减半，悬浮窗那边下一拍也会跟着变
@@ -1453,35 +1506,6 @@ private fun StepButton(text: String, enabled: Boolean, onClick: () -> Unit) {
 
 // ======================= 工具 =======================
 
-/**
- * 横轴两端和中间的三个时间标签。
- *
- * 中间那个取「时间上最接近区间中点」的采样，不是「下标在中间的」采样：曲线现在是
- * 按真实时间排布横坐标的（见 LineChart 的 xValues），标签却画在绘图区正中间，
- * 两者口径不一致的话，中间那个时间会指到一个跟它不对应的位置上。采样间隔均匀时
- * 两者等价，不均匀时（开着「仅亮屏时记录」）能差出好几个小时。
- */
-internal fun axisLabels(times: List<Long>): List<String> {
-    if (times.size < 2) {
-        return emptyList()
-    }
-    val midTs = times.first() + (times.last() - times.first()) / 2
-    var mid = times[times.size / 2]
-    var bestGap = Long.MAX_VALUE
-    for (t in times) {
-        val gap = Math.abs(t - midTs)
-        if (gap < bestGap) {
-            bestGap = gap
-            mid = t
-        }
-    }
-    return listOf(
-        fmtClock(times.first()),
-        fmtClock(mid),
-        fmtClock(times.last())
-    )
-}
-
 /** 时长：按量级换单位，秒级的不写成 0 分 */
 internal fun fmtDuration(ms: Long): String {
     if (ms <= 0L) {
@@ -1505,6 +1529,25 @@ private val CLOCK_FMT = SimpleDateFormat("HH:mm", Locale.getDefault())
 
 internal fun fmtDateTime(ts: Long): String = TIME_FMT.format(Date(ts))
 internal fun fmtClock(ts: Long): String = CLOCK_FMT.format(Date(ts))
+
+/**
+ * 现在是不是插着电。
+ *
+ * 读 `ACTION_BATTERY_CHANGED` 的粘性广播（receiver 传 null 就是「只取缓存那份，
+ * 不注册」），所以不耗电、也不需要注销。读不到就按「没插电」处理：那只是让
+ * 「仅亮屏时记录」保持用户自己设的状态，不会误改任何东西。
+ */
+internal fun readChargingNow(context: Context): Boolean {
+    return try {
+        val intent = context.registerReceiver(
+            null,
+            IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        )
+        intent != null && intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+    } catch (e: Throwable) {
+        false
+    }
+}
 
 /** 批量把包名解析成应用名；解析不到就留着包名，不显示成空白 */
 internal fun appLabels(context: Context, packages: List<String>): Map<String, String> {

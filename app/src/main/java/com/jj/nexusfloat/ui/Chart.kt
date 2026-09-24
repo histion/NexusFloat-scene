@@ -62,6 +62,9 @@ data class ChartLine(
     val dashed: Boolean = false
 )
 
+/** 横轴上的一个刻度：时间戳 + 显示文案 */
+data class ChartXTick(val ts: Long, val label: String)
+
 private val ChartHeight = 168.dp
 /**
  * 左右留出来的刻度文字宽度。
@@ -74,6 +77,10 @@ internal val ChartAxisGutter = 36.dp
 internal val ChartAxisGutterSmall = 8.dp
 private val TopPadding = 10.dp
 private val BottomLabelsHeight = 16.dp
+/** 没给步长时纵轴均分几格 */
+private const val GridCount = 4
+/** 一根轴上最多画几条刻度；超过说明步长或量程设得不对，退回均分 */
+private const val MAX_TICKS = 12
 
 @Composable
 fun LineChart(
@@ -86,8 +93,12 @@ fun LineChart(
     showRightAxis: Boolean = false,
     leftFormat: (Float) -> String = { it.toInt().toString() },
     rightFormat: (Float) -> String = { it.toInt().toString() },
-    /** 横轴两端和中间的三个标签，空列表就不画 */
-    xLabels: List<String> = emptyList(),
+    /** 左轴刻度间隔；给了就按这个步长画刻度线（0/20/40…），不给就均分 4 格 */
+    leftStep: Float? = null,
+    /** 右轴刻度间隔，语义同 leftStep（功率传 10f 就是每 10W 一条） */
+    rightStep: Float? = null,
+    /** 横轴刻度（时间 + 文案），按 xValues 的时间比例定位；空列表就不画 */
+    xTicks: List<ChartXTick> = emptyList(),
     /** 第一条曲线下面铺渐变，让主线有个「面积」的份量 */
     fillPrimary: Boolean = true,
     /**
@@ -109,6 +120,8 @@ fun LineChart(
 ) {
     val measurer = rememberTextMeasurer()
     val gridColor = MdThemeOnSurfaceVariant.copy(alpha = 0.18f)
+    /** 竖直网格比横网格更淡：它只是「时间刻度」的辅助线，别抢了曲线 */
+    val xGridColor = MdThemeOnSurfaceVariant.copy(alpha = 0.10f)
     val axisTextColor = MdThemeOnSurfaceVariant
     val plotBorderColor = MdThemeOnSurfaceVariant.copy(alpha = 0.30f)
     val iconPlaceholderColor = MdThemeOnSurfaceVariant.copy(alpha = 0.30f)
@@ -124,7 +137,7 @@ fun LineChart(
             val leftPad = ChartAxisGutter.toPx()
             val rightPad = if (showRightAxis) ChartAxisGutter.toPx() else ChartAxisGutterSmall.toPx()
             val topPad = TopPadding.toPx()
-            val bottomPad = if (xLabels.isEmpty()) 6.dp.toPx() else BottomLabelsHeight.toPx()
+            val bottomPad = if (xTicks.isEmpty()) 6.dp.toPx() else BottomLabelsHeight.toPx()
 
             val plotW = size.width - leftPad - rightPad
             val plotH = size.height - topPad - bottomPad
@@ -132,18 +145,29 @@ fun LineChart(
                 return@Canvas
             }
 
+            // 横轴刻度：位置只算一次，竖网格（画在塔和曲线下面）和标签（画在最上面）
+            // 共用同一批位置，不然标签会和它对应的那条竖线错开
+            val tickMarks = layoutXTicks(
+                ticks = xTicks,
+                xValues = xValues,
+                leftPad = leftPad,
+                plotW = plotW,
+                measurer = measurer,
+                style = xLabelStyle,
+                minGap = 44.dp.toPx()
+            )
+
             // ---- 横向网格 + 左右刻度 ----
-            val gridCount = 4
-            for (i in 0..gridCount) {
-                val y = topPad + plotH * i / gridCount
+            // 左轴每格一条水平线 + 一个左侧刻度文字
+            axisValues(leftMin, leftMax, leftStep).forEach { value ->
+                val y = topPad + plotH * (1f - scale(value, leftMin, leftMax))
                 drawLine(
                     color = gridColor,
                     start = Offset(leftPad, y),
                     end = Offset(leftPad + plotW, y),
                     strokeWidth = 1f
                 )
-                val leftValue = leftMax - (leftMax - leftMin) * i / gridCount
-                val leftText = leftFormat(leftValue)
+                val leftText = leftFormat(value)
                 drawText(
                     textMeasurer = measurer,
                     text = leftText,
@@ -153,15 +177,32 @@ fun LineChart(
                         y = y - 5.dp.toPx()
                     )
                 )
-                if (showRightAxis) {
-                    val rightValue = rightMax - (rightMax - rightMin) * i / gridCount
+            }
+            if (showRightAxis) {
+                // 右轴只画文字、不画线：左右轴步长不同时 y 位置不一样，
+                // 线由左轴负责，各画各的网格会叠出两套错开的横线
+                axisValues(rightMin, rightMax, rightStep).forEach { value ->
+                    val y = topPad + plotH * (1f - scale(value, rightMin, rightMax))
                     drawText(
                         textMeasurer = measurer,
-                        text = rightFormat(rightValue),
+                        text = rightFormat(value),
                         style = labelStyle,
                         topLeft = Offset(leftPad + plotW + 4.dp.toPx(), y - 5.dp.toPx())
                     )
                 }
+            }
+
+            // ---- 横轴竖直网格：只画中间那些刻度，首尾本来就贴着绘图区边界 ----
+            tickMarks.forEachIndexed { i, mark ->
+                if (i == 0 || i == tickMarks.size - 1) {
+                    return@forEachIndexed
+                }
+                drawLine(
+                    color = xGridColor,
+                    start = Offset(mark.centerX, topPad),
+                    end = Offset(mark.centerX, topPad + plotH),
+                    strokeWidth = 1f
+                )
             }
 
             // ---- 应用图标塔：画在网格之上、曲线之下 ----
@@ -255,21 +296,15 @@ fun LineChart(
                 }
             }
 
-            // ---- 横轴标签 ----
-            if (xLabels.isNotEmpty()) {
+            // ---- 横轴标签：位置沿用 tickMarks（画在最上层，压住曲线和塔） ----
+            if (tickMarks.isNotEmpty()) {
                 val y = size.height - BottomLabelsHeight.toPx() + 2.dp.toPx()
-                xLabels.forEachIndexed { i, text ->
-                    val w = measureWidth(measurer, text, xLabelStyle)
-                    val x = when (i) {
-                        0 -> leftPad
-                        xLabels.size - 1 -> leftPad + plotW - w
-                        else -> leftPad + plotW / 2f - w / 2f
-                    }
+                tickMarks.forEach { mark ->
                     drawText(
                         textMeasurer = measurer,
-                        text = text,
+                        text = mark.label,
                         style = xLabelStyle,
-                        topLeft = Offset(x, y)
+                        topLeft = Offset(mark.labelLeft, y)
                     )
                 }
             }
@@ -384,6 +419,101 @@ private fun scale(value: Float, min: Float, max: Float): Float {
 /** 量一段文字的宽度，用来做右对齐和居中 */
 private fun measureWidth(measurer: TextMeasurer, text: String, style: TextStyle): Float {
     return measurer.measure(text, style).size.width.toFloat()
+}
+
+/**
+ * 一根轴上的刻度值序列。
+ *
+ * 给了 step 就从「第一个不小于 min 的 step 整数倍」开始逐个加 step 直到 max，
+ * 用整数下标乘 step 来算，避免浮点累加攒误差（0.1 的整数倍最明显）。
+ *
+ * 步长太细、条数超过 MAX_TICKS 时，把步长按整数倍放大（10W → 20W → 30W…）
+ * 再算一遍，**不要退回「均分 4 格」**——退回去刻度值又变成 35、70 这种零碎
+ * 数字，那正是要修掉的东西。放大之后仍然是整齐的整数倍。
+ * 只有量程窄到连放大后的步长都放不下两个刻度时（或者压根没给 step），
+ * 才交给均分兜底。
+ */
+private fun axisValues(min: Float, max: Float, step: Float?): List<Float> {
+    if (step != null && step > 0f && max - min > 0.001f) {
+        var k = 1
+        while (k <= 64) {
+            val s = step * k
+            val first = Math.ceil((min / s).toDouble()).toInt()
+            val last = Math.floor((max / s).toDouble()).toInt()
+            val count = last - first + 1
+            if (count in 2..MAX_TICKS) {
+                return (first..last).map { it * s }
+            }
+            if (count < 2) {
+                break
+            }
+            k++
+        }
+    }
+    return (0..GridCount).map { min + (max - min) * it / GridCount }
+}
+
+/** 一个已经定好位置的横轴刻度 */
+private data class XTickMark(val centerX: Float, val labelLeft: Float, val label: String)
+
+/**
+ * 某个时间戳对应的横坐标。
+ *
+ * 和 xAt() 用的是同一套比例（都以 xValues 的时间跨度为分母），所以刻度标签、
+ * 曲线、图标塔三者严格对齐。xValues 缺失或时间跨度 <= 0 时返回左边界（不画错位的东西）。
+ */
+private fun xAtTime(ts: Long, xValues: List<Long>?, leftPad: Float, plotW: Float): Float {
+    if (xValues == null || xValues.size < 2) {
+        return leftPad
+    }
+    val first = xValues.first()
+    val span = xValues.last() - first
+    if (span <= 0L) {
+        return leftPad
+    }
+    return (leftPad + plotW * ((ts - first).toFloat() / span.toFloat()))
+        .coerceIn(leftPad, leftPad + plotW)
+}
+
+/**
+ * 算横轴刻度标签的位置，并做防重叠筛选。
+ *
+ * 首尾两个刻度一定保留（分别贴左右边），中间的按「和上一个保留的标签至少隔开
+ * minGap」过滤——10 分钟一条刻度，充两三个小时就是十几条，全画出来会糊成一片。
+ * 太靠近右端的中间刻度也丢掉，否则会和末刻度的文字叠字。
+ */
+private fun layoutXTicks(
+    ticks: List<ChartXTick>,
+    xValues: List<Long>?,
+    leftPad: Float,
+    plotW: Float,
+    measurer: TextMeasurer,
+    style: TextStyle,
+    minGap: Float
+): List<XTickMark> {
+    if (ticks.isEmpty()) {
+        return emptyList()
+    }
+    val out = ArrayList<XTickMark>(ticks.size)
+    var lastRight = -Float.MAX_VALUE
+    ticks.forEachIndexed { i, tick ->
+        val isEdge = i == 0 || i == ticks.size - 1
+        val cx = xAtTime(tick.ts, xValues, leftPad, plotW)
+        val w = measureWidth(measurer, tick.label, style)
+        val labelLeft = when {
+            i == 0 -> leftPad
+            isEdge -> (leftPad + plotW - w).coerceAtLeast(leftPad)
+            else -> (cx - w / 2f).coerceIn(leftPad, (leftPad + plotW - w).coerceAtLeast(leftPad))
+        }
+        val tooClose = !isEdge && labelLeft < lastRight + minGap
+        val hitRight = !isEdge && labelLeft + w > leftPad + plotW - minGap * 0.5f
+        if (tooClose || hitRight) {
+            return@forEachIndexed
+        }
+        lastRight = labelLeft + w
+        out.add(XTickMark(cx, labelLeft, tick.label))
+    }
+    return out
 }
 
 /**
@@ -679,4 +809,41 @@ internal fun towerTotals(rows: List<com.jj.nexusfloat.stats.StatsStore.FgBucket>
     return map.entries
         .sortedByDescending { it.value }
         .map { it.key to it.value }
+}
+
+/** 横轴刻度的最多条数；超了就说明时间跨度异常大，直接放弃画刻度而不是卡死 */
+private const val MAX_X_TICKS = 512
+
+/**
+ * 按固定时间步长生成横轴刻度。
+ *
+ * 刻度对齐到**本地时间的自然边界**（10 分钟刻度落在 xx:00 或 xx:10 或 xx:20 等，
+ * 6 小时刻度落在 00:00 或 06:00 或 12:00 或 18:00），而不是「从第一个采样点往后数」——
+ * 后者画出来是一堆 xx:07、xx:23 这种时间，读数还得自己心算。用本地时区偏移把
+ * epoch 的整倍数换算成本地整点：floorDiv(t - offset, step) * step + offset。
+ * 首尾两个采样点另外补上并去重，保证曲线两端一定有刻度。
+ */
+internal fun axisTicks(times: List<Long>, stepMs: Long): List<ChartXTick> {
+    if (times.size < 2 || stepMs <= 0L) {
+        return emptyList()
+    }
+    val from = times.first()
+    val to = times.last()
+    if (to <= from) {
+        return emptyList()
+    }
+    val offset = java.util.TimeZone.getDefault().getOffset(from).toLong()
+    var t = Math.floorDiv(from - offset, stepMs) * stepMs + offset
+    if (t < from) {
+        t += stepMs
+    }
+    val out = ArrayList<ChartXTick>()
+    var guard = 0
+    while (t <= to && guard++ < MAX_X_TICKS) {
+        out.add(ChartXTick(t, fmtClock(t)))
+        t += stepMs
+    }
+    out.add(ChartXTick(from, fmtClock(from)))
+    out.add(ChartXTick(to, fmtClock(to)))
+    return out.distinctBy { it.ts }.sortedBy { it.ts }
 }

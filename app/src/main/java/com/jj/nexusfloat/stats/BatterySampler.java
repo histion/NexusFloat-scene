@@ -237,6 +237,21 @@ public final class BatterySampler {
     }
 
     /**
+     * 这一刻要不要按「仅亮屏时记录」跳过落点。
+     *
+     * 充电期间恒不跳过：插着电谈不上省电，而跳过的代价是一次整夜充电只剩零星几个点，
+     * 收尾时样本太少会被判成无效会话直接删掉，充电记录就全没了。
+     *
+     * 这条规则同时反映在界面上：统计设置里那一行在充电时会显示成「已自动关闭」且
+     * 不可点，拔电后恢复用户原本的选择。注意用户的设置值**从头到尾没有被改写**，
+     * 所以「恢复原本的状态」是天然的——真去「先存原值、改掉、充电完再写回来」的话，
+     * 进程一旦在充电中途被杀，用户的选择就永久丢了。
+     */
+    private boolean skipByScreenOnly(boolean screenOn, int plugged) {
+        return readScreenOnOnly() && !screenOn && plugged == 0;
+    }
+
+    /**
      * 注册电池与亮灭屏广播。
      *
      * 电池广播是「粘性」的：注册之后系统会立刻把当前状态补一份过来，所以顺带
@@ -322,16 +337,14 @@ public final class BatterySampler {
         int levelNow = readLevel(intent);
         int pluggedNow = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
 
-        if (readScreenOnOnly() && !screenOn && pluggedNow == 0) {
-            // 用户选了「只在亮屏时记录」，息屏期间不落点。
+        if (skipByScreenOnly(screenOn, pluggedNow)) {
+            // 用户选了「只在亮屏时记录」，息屏期间不落点（充电时不算，见
+            // skipByScreenOnly 的注释）。
             //
             // 但状态机照样要跑：充电器插拔的转折不能因为息屏就漏掉，不然拔电那一刻
             // 开始的放电周期要等到下次亮屏才建，前面那段时间全被算进上一轮。
             // writeTotals 传 false：这一刻没必要重算汇总，反正没新采样点，
             // 等下一次真正落点时会一起更新。
-            //
-            // 充电中不进这个分支：充电时不落点的话，一次整夜充电只会留下零星几个点，
-            // 收尾时因为样本太少被判成无效会话直接删掉，充电记录就全没了。
             handleTransitions(now, levelNow, pluggedNow, false);
             return;
         }

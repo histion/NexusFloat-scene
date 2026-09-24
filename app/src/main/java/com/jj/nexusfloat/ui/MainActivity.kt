@@ -1,5 +1,6 @@
 package com.jj.nexusfloat.ui
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -11,6 +12,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -80,6 +82,9 @@ class MainActivity : ComponentActivity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /** 接管返回键的那个回调；开关切换时要同步它的 isEnabled */
+    private var recentsBackCallback: OnBackPressedCallback? = null
+
     private var showPortrait by mutableStateOf(true)
     private var showLandscape by mutableStateOf(true)
     /** 息屏时还显不显示监视条（v1.8.10），默认不显示 */
@@ -108,6 +113,8 @@ class MainActivity : ComponentActivity() {
     private var gpuBarEnabled by mutableStateOf(true)
     /** 「双电芯」开关，默认关；开了之后功率乘 2 */
     private var dualCellEnabled by mutableStateOf(false)
+    /** 「退出后隐藏最近任务卡片」开关，默认关；开了之后最近任务里不再出现本软件的卡片 */
+    private var hideRecentsOnExit by mutableStateOf(false)
     /** 悬浮窗字号（sp） */
     private var fontSizeSp by mutableStateOf(Constants.Ui.TEXT_SIZE_SP)
     /** 悬浮窗字体加不加粗（v1.8.9） */
@@ -223,6 +230,7 @@ class MainActivity : ComponentActivity() {
         cpuBarEnabled = readSwitch(Constants.Modules.KEY_CPU_BAR, default = true)
         gpuBarEnabled = readSwitch(Constants.Modules.KEY_GPU_BAR, default = true)
         dualCellEnabled = readSwitch(Constants.Modules.KEY_DUAL_CELL, default = false)
+        hideRecentsOnExit = readSwitch(Constants.Modules.KEY_HIDE_RECENTS_ON_EXIT, default = false)
         appFilterEnabled = readSwitch(Constants.Modules.KEY_APP_FILTER, default = false)
         whitelist = readWhitelist()
         fontSizeSp = readFloat(Constants.Modules.KEY_FONT_SIZE, Constants.Ui.TEXT_SIZE_SP)
@@ -263,6 +271,19 @@ class MainActivity : ComponentActivity() {
             readString(Constants.Modules.KEY_SPACE_BEFORE, "")
         )
         spaceBeforeText = readString(Constants.Modules.KEY_SPACE_BEFORE, "")
+
+        // 「退出后隐藏最近任务卡片」（v8.8.9.2）：
+        // 开关开着时，返回键/返回手势退出直接把这条任务从最近任务里移除，
+        // 而不是只把界面推到后台留一张卡片。开关关着时这个回调 isEnabled = false，
+        // 系统默认行为（退回桌面、卡片留着）不变。
+        recentsBackCallback = object : OnBackPressedCallback(hideRecentsOnExit) {
+            override fun handleOnBackPressed() {
+                finishAndRemoveTask()
+            }
+        }
+        onBackPressedDispatcher.addCallback(this, recentsBackCallback!!)
+        // App 每次启动时按开关状态把任务同步一次：上次开着、这次重进也要生效
+        applyRecentsExclusion(hideRecentsOnExit)
 
         setContent {
             // 主题只影响 App 界面：跟随系统就用 isSystemInDarkTheme()，
@@ -387,6 +408,22 @@ class MainActivity : ComponentActivity() {
                                 Toast.makeText(
                                     this@MainActivity,
                                     if (checked) "功率已按双电芯翻倍" else "功率已恢复单电芯",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            },
+                            hideRecentsOnExit = hideRecentsOnExit,
+                            onHideRecentsOnExitChange = { checked ->
+                                hideRecentsOnExit = checked
+                                saveLocalSwitch(Constants.Modules.KEY_HIDE_RECENTS_ON_EXIT, checked)
+                                recentsBackCallback?.isEnabled = checked
+                                applyRecentsExclusion(checked)
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    if (checked) {
+                                        "已开启：最近任务里不再留本软件的卡片"
+                                    } else {
+                                        "已关闭：最近任务里恢复显示本软件"
+                                    },
                                     Toast.LENGTH_SHORT
                                 ).show()
                             },
@@ -527,6 +564,37 @@ class MainActivity : ComponentActivity() {
             StatsService.stop(this)
             Toast.makeText(this, "已停止统计，历史数据仍然保留", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /**
+     * 把本任务从「最近任务」里排除 / 恢复。
+     *
+     * AppTask.setExcludeFromRecents 只影响最近任务列表里显不显示这一条，既不结束
+     * 这个任务、也不影响进程里跑着的采集和前台服务——用户要的只是「划掉卡片清理
+     * 内存那儿别碍眼」。个别 ROM 上任务可能已经被系统回收，调用会抛异常，
+     * 失败就只是没生效，不能让它把界面带崩。
+     */
+    private fun applyRecentsExclusion(exclude: Boolean) {
+        try {
+            val am = getSystemService(ActivityManager::class.java) ?: return
+            for (task in am.appTasks) {
+                task.setExcludeFromRecents(exclude)
+            }
+        } catch (e: Exception) {
+            LogUtils.w("setExcludeFromRecents($exclude) failed", e)
+        }
+    }
+
+    /**
+     * 只写本地的开关。
+     *
+     * saveSwitch 会连 RemotePreferences 一起写、还会推一次 Settings.Global
+     * （要 fork 一次 root 命令）。「退出后隐藏最近任务卡片」纯属本 App 自己的
+     * 界面行为，SystemUI 用不到，没必要付这个代价。
+     */
+    private fun saveLocalSwitch(key: String, enabled: Boolean) {
+        getSharedPreferences(Constants.Remote.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(key, enabled).apply()
     }
 
     /**
@@ -1222,6 +1290,8 @@ fun MainScreen(
     onTextColorChange: (Int) -> Unit,
     dualCellEnabled: Boolean,
     onDualCellChange: (Boolean) -> Unit,
+    hideRecentsOnExit: Boolean,
+    onHideRecentsOnExitChange: (Boolean) -> Unit,
     appFilterEnabled: Boolean,
     onAppFilterChange: (Boolean) -> Unit,
     selectedAppCount: Int,
@@ -1298,7 +1368,9 @@ fun MainScreen(
                     onAppThemeChange = onAppThemeChange,
                     hasWallpaper = hasWallpaper,
                     onPickWallpaper = onPickWallpaper,
-                    onClearWallpaper = onClearWallpaper
+                    onClearWallpaper = onClearWallpaper,
+                    hideRecentsOnExit = hideRecentsOnExit,
+                    onHideRecentsOnExitChange = onHideRecentsOnExitChange
                 )
             }
 
@@ -1474,7 +1546,9 @@ fun HeaderCard(
     onAppThemeChange: (Int) -> Unit,
     hasWallpaper: Boolean,
     onPickWallpaper: () -> Unit,
-    onClearWallpaper: () -> Unit
+    onClearWallpaper: () -> Unit,
+    hideRecentsOnExit: Boolean,
+    onHideRecentsOnExitChange: (Boolean) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1567,6 +1641,16 @@ fun HeaderCard(
                     }
                 }
             }
+
+            // 退出后隐藏最近任务卡片（v8.8.9.2）：只跟本 App 自己的界面行为有关，
+            // 跟监视项、统计都无关，跟主题和壁纸放在同一张卡里
+            Spacer(modifier = Modifier.height(8.dp))
+            ToggleRow(
+                label = Constants.Modules.LABEL_HIDE_RECENTS_ON_EXIT,
+                checked = hideRecentsOnExit,
+                onCheckedChange = onHideRecentsOnExitChange,
+                description = "开启后最近任务里不再出现本软件的卡片，返回键退出会直接清掉这条任务"
+            )
         }
     }
 }
@@ -2708,25 +2792,39 @@ fun StatusCard(
 internal fun MetricTile(
     title: String,
     value: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /**
+     * 紧凑版：一行排四个的时候用。
+     *
+     * 四个格子平分下来每格只剩七十来 dp，19sp 的「178 mA」会折成两行、几个格子
+     * 高低不齐。收一档内边距和字号，并且禁止折行——窄屏上宁可省略号，也不能
+     * 让四块卡片的高度对不上。
+     */
+    compact: Boolean = false
 ) {
     Column(
         modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(if (compact) 12.dp else 14.dp))
             .background(ToggleOffContainer)
-            .padding(horizontal = 14.dp, vertical = 10.dp)
+            .padding(
+                horizontal = if (compact) 8.dp else 14.dp,
+                vertical = if (compact) 9.dp else 10.dp
+            )
     ) {
         Text(
             text = title,
-            fontSize = 11.sp,
-            color = MdThemeOnSurfaceVariant
+            fontSize = if (compact) 10.sp else 11.sp,
+            color = MdThemeOnSurfaceVariant,
+            maxLines = 1
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = value,
-            fontSize = 19.sp,
+            fontSize = if (compact) 14.sp else 19.sp,
             fontWeight = FontWeight.Bold,
-            color = MdThemeOnSurface
+            color = MdThemeOnSurface,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -2796,6 +2894,21 @@ private data class ChangelogEntry(val version: String, val summary: String)
  * shell 内建 read）只在能被观察到时才写进来，那一条的观察点是耗电。
  */
 private val CHANGELOG = listOf(
+    ChangelogEntry(
+        "8.8.9.3",
+        "充电时「仅亮屏时记录」自动关闭：插着电本来就是全量记录，这个开关在充电期间" +
+                "显示为关闭并置灰，拔电后恢复你原本的选择（原本没开的一直是关闭）。" +
+                "「当前状态」卡片去掉电量旁边那行小字（功率 · 电压 · 温度），" +
+                "新增「电压」一格，和电流、功率、电池温度并排成四个格子。"
+    ),
+    ChangelogEntry(
+        "8.8.9.2",
+        "曲线刻度改成整齐的整数步长：充电曲线的电量每 20%、功率每 10W、时间每 10 分钟一条刻度，" +
+                "使用过程曲线的时间每 6 小时、电量每 20% 一条，刻度值不再出现 25%、1.25W " +
+                "这种零碎数字；横轴的刻度标签会自动避让，密到画不下时按最小间距挑着画。" +
+                "新增「退出后隐藏最近任务卡片」开关（默认关）：开启后最近任务里不再出现本软件的" +
+                "卡片，用返回键或返回手势退出时直接把这条任务清掉，不用再手动划走。"
+    ),
     ChangelogEntry(
         "8.8.8.9",
         "新增「统计」页：充电记录、使用周期、应用使用情况榜、累计统计，数据存本机、永久保留。" +
