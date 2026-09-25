@@ -22,7 +22,7 @@ import java.util.Locale;
  *
  * 非线程安全，只该由采集线程调。
  */
-final class SurfaceFlingerFpsReader {
+public final class SurfaceFlingerFpsReader {
 
     /** 参数不被支持连着判定了多少次 */
     private int unsupportedCount;
@@ -63,7 +63,7 @@ final class SurfaceFlingerFpsReader {
     /** 上一次失败卡在哪一步，见 Constants.Fps.SF_FAIL_*；成功时是空串 */
     private String lastFailure = "";
 
-    boolean lastViaRoot() {
+    public boolean lastViaRoot() {
         return lastViaRoot;
     }
 
@@ -73,7 +73,7 @@ final class SurfaceFlingerFpsReader {
      * 这条路取的是合成器级的上屏时间，不保证严格等于前台应用的渲染帧率，
      * 所以在诊断标记里单独标出来，方便判断数值可不可信。
      */
-    boolean lastViaDisplay() {
+    public boolean lastViaDisplay() {
         return lastViaDisplay;
     }
 
@@ -103,7 +103,7 @@ final class SurfaceFlingerFpsReader {
      *
      * 返回帧率；画面静止时 0；这条路用不了时返回 Constants.Fps.READ_FAILED。
      */
-    float read(String foregroundPkg, boolean preferRoot) {
+    public float read(String foregroundPkg, boolean preferRoot) {
         badFormatThisTick = false;
         if (unsupportedCount >= Constants.Fps.SF_CHANNEL_MAX_FAILURES) {
             return fail(Constants.Fps.SF_FAIL_UNSUPPORTED);
@@ -625,7 +625,7 @@ final class SurfaceFlingerFpsReader {
     }
 
     /** 采集停了就释放 dump 线程 */
-    synchronized void shutdown() {
+    public synchronized void shutdown() {
         SfDumpChannel.get().shutdown();
     }
 }

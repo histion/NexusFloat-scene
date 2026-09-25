@@ -1967,11 +1967,117 @@ public final class Constants {
         private Stats() {}
     }
 
+    /**
+     * 帧率记录（v9.0.0.0）。
+     *
+     * 跟统计（Stats）完全分开的原因：两边是两回事。统计是「常年在后台默默记」的
+     * 低频采样（15 秒一个点、只关心电池），帧记录是「用户手动开一次、记一会儿」的
+     * 高频采样（1 秒一个点、关心帧率/CPU/GPU/温度全家桶）。频率差 15 倍、字段几乎
+     * 不重叠，塞进同一个库里只会让「清空统计数据」的语义变得说不清——用户清统计
+     * 大概率不想连帧记录一起没。
+     */
+    public static final class Frame {
+
+        // ---- 数据库 ----
+
+        public static final String DB_NAME = "nexus_frames.db";
+        /**
+         * v1 是 9.0.0.0 首版。v2 修的是 refreshAggregates 的列错位：
+         * 首版 SQL 多输出了一列「有效点数」，读取端从 idx1 起整体错位，
+         * 详情页汇总卡的平均帧率/最低帧率/峰值功率等全部错位。
+         * 升级时在 onUpgrade 里把已存记录逐条重算一遍（见 FrameRecordStore）。
+         */
+        public static final int DB_VERSION = 2;
+        /** 明细保留天数。1 秒一个点很占地：一小时 3600 行，留 30 天足够回看 */
+        public static final int SAMPLE_RETENTION_DAYS = 30;
+
+        /**
+         * 一次记录至少要有这么多采样点才留存。
+         *
+         * 误触悬浮球一两秒就停掉的记录只剩一两个点，画不出曲线也没有统计意义。
+         */
+        public static final int RECORD_MIN_SAMPLES = 5;
+
+        /** 详情页曲线最多画多少个点。超出就按 rowid 取模抽稀（同 StatsStore 的做法） */
+        public static final int CURVE_MAX_POINTS = 3600;
+
+        // ---- 采样 ----
+
+        /** 采样间隔。帧率曲线要能看出掉帧的时刻，1 秒是肉眼可辨的最细粒度下限 */
+        public static final int SAMPLE_INTERVAL_MS = 1000;
+        /** 采样点攒够多少条才批量落库。每秒 fsync 一次太浪费，5 秒一批够了 */
+        public static final int FLUSH_EVERY_TICKS = 5;
+        /**
+         * 前台应用多少毫秒重查一次。
+         *
+         * 查询走 UsageStats（有「使用情况访问」权限时），不便宜，但也不是每秒都要：
+         * 用户记录中途切应用是少数情况，5 秒的延迟对「这条记录主要是谁」没有影响。
+         */
+        public static final long FG_REFRESH_MS = 5000L;
+
+        /**
+         * 上一次读 /proc/stat 超过这么久没更新，基线就当过期作废（毫秒）。
+         *
+         * CPU 占用是相邻两拍做差算的，隔太久的两拍之间夹着一大段没采样的时间，
+         * 算出来的数既不是这一刻的也不是平均值。放宽到 3 秒而不是「等于采样间隔」，
+         * 是为了容忍进程被冻结、调度抖动导致某一拍晚了几百毫秒——那还是相邻两拍。
+         */
+        public static final long CPU_BASELINE_STALE_MS = 3000L;
+
+        /**
+         * 本地读 /proc/stat 连着这么多拍读不到（或者完全没有推进）就换 root 通道。
+         *
+         * 留几拍的缓冲是因为「某一拍读失败」很常见（进程刚被解冻、CPU 全忙），
+         * 一次抖动不值得把 su 拉起来常驻；连着三拍都是空的，就说明这条路本身不通。
+         */
+        public static final int CPU_ROOT_FALLBACK_TROUBLES = 3;
+
+        // ---- 悬浮球 ----
+
+        /** 悬浮球宽（胶囊长轴）。原来是 52dp 圆，现改成更小一点的长方形 */
+        public static final int BUBBLE_WIDTH_DP = 44;
+        /** 悬浮球高（胶囊短轴）。宽 44 / 高 22 就是圆角 11dp 的胶囊 */
+        public static final int BUBBLE_HEIGHT_DP = 22;
+        /** 未记录时的棕黄色。取暗金（DarkGoldenrod）：够「棕黄」，压在浅色游戏画面上也看得清 */
+        public static final int BUBBLE_IDLE_COLOR = 0xFFB8860B;
+        /** 记录中的红色 */
+        public static final int BUBBLE_RECORDING_COLOR = 0xFFE53935;
+        /** 记录中提示环闪烁的周期（毫秒） */
+        public static final long BUBBLE_PULSE_MS = 600L;
+        /** 判定成「点按」而不是「拖动」的最大位移（px） */
+        public static final int BUBBLE_TOUCH_SLOP_PX = 12;
+        /** 长按多少毫秒移除悬浮球 */
+        public static final long BUBBLE_LONG_PRESS_MS = 600L;
+
+        // ---- 前台服务 / 通知 ----
+
+        public static final String CHANNEL_ID = "nexusfloat_frame";
+        public static final String CHANNEL_NAME = "帧率记录";
+        /** 通知 id 别跟 Stats 的 0x4E46 撞上：两个前台服务各占一条 */
+        public static final int NOTIFICATION_ID = 0x4E47;
+        public static final String ACTION_SHOW_BUBBLE = Package.MODULE + ".action.FRAME_SHOW_BUBBLE";
+        public static final String ACTION_STOP = Package.MODULE + ".action.FRAME_STOP";
+
+        // ---- GPU 温度 ----
+
+        /**
+         * thermal zone 的 type 里含这些字样（转小写比较）就当 GPU 温度源。
+         *
+         * 各家叫法不一样：高通是 gpu / gpu0 / kgsl，联发科常见 mali / gpu。按序试，
+         * 命中一个就缓存住。都找不到就返回 NaN，图上画成断点而不是编一个数。
+         */
+        public static final String[] GPU_TYPE_HINTS = {"gpu", "mali", "kgsl", "adreno"};
+
+        private Frame() {}
+    }
+
     /** 后台线程名 */
     public static final class ThreadName {
         public static final String GPU_COLLECTOR = "GpuCollector";
         /** 电池采样循环 */
         public static final String STATS_SAMPLER = "StatsSampler";
+        /** 帧率记录采样循环 */
+        public static final String FRAME_SAMPLER = "FrameSampler";
         /** UsageStats / root 取应用用量的工作线程 */
         public static final String STATS_USAGE = "StatsUsage";
         public static final String NEXUS_COLLECTOR = "NexusCollector";

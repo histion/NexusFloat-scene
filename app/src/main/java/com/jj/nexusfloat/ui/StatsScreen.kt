@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas as AndroidCanvas
 import android.graphics.drawable.Drawable
 import android.os.BatteryManager
+import android.util.LruCache
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
@@ -1694,24 +1695,37 @@ internal fun appLabels(context: Context, packages: List<String>): Map<String, St
     return out
 }
 
+/** 应用图标解码缓存（进程级）。图标解码不便宜，帧记录页 3 秒刷一次，没缓存等于反复解同一批 */
+private val iconCache = LruCache<String, ImageBitmap>(64)
+
 /**
  * 批量取应用图标。
  *
  * 手动把 Drawable 画进 Bitmap 而不是用 core-ktx 的 toBitmap：本项目的依赖里
  * 没有 core-ktx（只有 appcompat 带进来的 core），为了一个转换函数再拉一个依赖不划算。
+ *
+ * 结果按包名缓存到 {@link #iconCache}：命中就不再解码，直接复用上一轮的 Bitmap。
+ * 签名不变，统计页、详情页、帧记录页等既有调用点自动受益。
  */
 internal fun appIcons(context: Context, packages: List<String>): Map<String, ImageBitmap> {
     val pm = context.packageManager
     val out = HashMap<String, ImageBitmap>(packages.size)
     val sizePx = (22 * context.resources.displayMetrics.density).toInt().coerceAtLeast(24)
     for (pkg in packages) {
+        val cached = iconCache.get(pkg)
+        if (cached != null) {
+            out[pkg] = cached
+            continue
+        }
         try {
             val icon: Drawable = pm.getApplicationIcon(pkg)
             val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
             val canvas = AndroidCanvas(bmp)
             icon.setBounds(0, 0, sizePx, sizePx)
             icon.draw(canvas)
-            out[pkg] = bmp.asImageBitmap()
+            val image = bmp.asImageBitmap()
+            iconCache.put(pkg, image)
+            out[pkg] = image
         } catch (e: Throwable) {
             // 图标拿不到就让它退回首字母占位，不影响其他行
         }

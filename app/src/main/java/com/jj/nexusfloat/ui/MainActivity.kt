@@ -1257,6 +1257,8 @@ private enum class MainTab(val title: String, val icon: String) {
     STATUS("状态", "◉"),
     /** 充电曲线 + 使用统计 + 设置：数据都是只读的看板，跟「调开关」分开放 */
     STATS("统计", "▤"),
+    /** 帧率记录：设备信息 + 历史记录 + 悬浮球开关，一页看完（v9.0.0.0） */
+    FRAMES("帧记录", "▢"),
     /** 监视项目 + 外观与校正：「显示什么」和「长什么样」搁一起才顺手 */
     MODULES("项目", "☰"),
     /** FPS 来源：六个开关加预设，独占一页 */
@@ -1348,6 +1350,11 @@ fun MainScreen(
     val scope = rememberCoroutineScope()
 
     Column(modifier = modifier) {
+        if (tab == MainTab.FRAMES) {
+            // 帧记录页自成一屏：它有自己固定的底部操作条（筛选/删除/加号），
+            // 不能塞进下面那个整页滚动的 Column 里——操作条得一直钉在页底
+            FrameRecordScreen(modifier = Modifier.weight(1f))
+        } else {
         // 每页各自滚动：key(tab) 让每页拿到独立的 ScrollState，切页后回到该页顶部。
         // 共用一个 state 的话，从长页面（项目）切到短页面（外观）会带着上一页的
         // 偏移量过去，看着像内容缺了一块
@@ -1474,7 +1481,12 @@ fun MainScreen(
                     fpsDebug = fpsDebug,
                     onFpsDebugChange = onFpsDebugChange
                 )
+
+                // 帧记录页在上面那个 if 里整页接管了（它有自己的底部操作条），
+                // 走不到这里；补一个空分支只是让 when 对枚举穷尽
+                MainTab.FRAMES -> {}
             }
+        }
         }
 
         BottomTabBar(selected = tab, onSelect = { tab = it })
@@ -2800,7 +2812,12 @@ internal fun MetricTile(
      * 高低不齐。收一档内边距和字号，并且禁止折行——窄屏上宁可省略号，也不能
      * 让四块卡片的高度对不上。
      */
-    compact: Boolean = false
+    compact: Boolean = false,
+    /**
+     * 标题前的 emoji 图标（如 🧠/📱/🤖），给设备信息这种「一眼看类别」的格子用。
+     * 传 null（默认）就维持原来的纯文字标题，既有调用点完全不受影响。
+     */
+    icon: String? = null
 ) {
     Column(
         modifier = modifier
@@ -2811,12 +2828,22 @@ internal fun MetricTile(
                 vertical = if (compact) 9.dp else 10.dp
             )
     ) {
-        Text(
-            text = title,
-            fontSize = if (compact) 10.sp else 11.sp,
-            color = MdThemeOnSurfaceVariant,
-            maxLines = 1
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (icon != null) {
+                Text(
+                    text = icon,
+                    fontSize = if (compact) 10.sp else 11.sp,
+                    maxLines = 1
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+            Text(
+                text = title,
+                fontSize = if (compact) 10.sp else 11.sp,
+                color = MdThemeOnSurfaceVariant,
+                maxLines = 1
+            )
+        }
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = value,
@@ -2894,6 +2921,35 @@ private data class ChangelogEntry(val version: String, val summary: String)
  * shell 内建 read）只在能被观察到时才写进来，那一条的观察点是耗电。
  */
 private val CHANGELOG = listOf(
+    ChangelogEntry(
+        "9.0.0.5",
+        "帧记录「CPU 占用」换成和顶部悬浮栏同一套算法：逐行容错（一行认不出来只丢这一行）、" +
+                "按 CPU 号落位而不是靠行的先后、第一拍就出数、没有推进时沿用上一次读数而不是落 0；" +
+                "App 进程直接读 /proc/stat 被拦下时会自动改走 root 通道读同一份文件，" +
+                "数值和悬浮栏看到的对得上。" +
+                "CPU 频率不再按簇画多条，只画「当前各簇中最高的那个频率」一条线，即悬浮栏" +
+                "CPU 频率括号里靠右的那个数，卡片标题已注明取的是各簇最高；" +
+                "GPU 频率纵轴改成按本次记录的频率跨度自动挑步长（5/10/25/50/100MHz…），" +
+                "保证轴上至少有 5 个刻度值，不再出现只有两个点、中间一大段空白的情况。"
+    ),
+    ChangelogEntry(
+        "9.0.0.1",
+        "修复帧记录里 CPU 占用恒显示 0%；删掉电量记录图和内存占用图；GPU 频率刻度改成" +
+                "动态区间（50MHz 一条、0 坐标从本次最低频率再往下 10MHz 开始）；功耗刻度改成" +
+                "0.5W 一条；汇总卡新增「总时间」（最小到秒）。"
+    ),
+    ChangelogEntry(
+        "9.0.0.0",
+        "新增「帧记录」页：底部多出一页，页首显示 CPU 型号、手机型号和安卓版本，" +
+                "下面是历次帧率记录。右下角「+」拉起一个悬浮球——默认棕黄色（未记录），" +
+                "点一下变红并开始记录当前应用/游戏的帧率，再点一下结束变回棕黄色并保存；" +
+                "按住悬浮球可以收掉。左下角「筛选」按应用分类过滤记录，再点一次恢复全部；" +
+                "「删除」展开多选，可批量删除或全部删除，和单条删除一样都要二次确认。" +
+                "点任意一条记录进入详情：备注可编辑，配有帧率、功耗、CPU 占用与频率、" +
+                "GPU 频率与占用、内存、电量、温度的曲线和汇总数据。数据全部存本机。" +
+                "本版更新：修复详情页汇总数值错位；悬浮球改成更小的长方形（未记录时写 fps），" +
+                "右下角按钮改为开关、可在页内直接关掉悬浮球；设备信息与筛选列表补上图标。"
+    ),
     ChangelogEntry(
         "8.8.9.4",
         "修复充电功率曲线断续：以前读不到电流/功率的那些采样点会被当成 0 落库，" +

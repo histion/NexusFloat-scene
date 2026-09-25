@@ -35,6 +35,13 @@
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
 
+    <!--
+        帧记录悬浮球（v9.0.0.0）。用户点「加号」后要切到游戏里去，控制球必须能
+        盖在别的应用上面。special 类型权限，要在系统设置里手动授；本模块有 root，
+        授权流程里会先试 appops 静默授一次，不行才把用户领到设置页。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <application
         android:name=".App"
         android:allowBackup="true"
@@ -69,6 +76,22 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="battery_charge_and_usage_statistics" />
+        </service>
+
+        <!--
+            帧率记录的前台服务（v9.0.0.0）。
+
+            用户在「帧记录」页点加号后切到游戏里，悬浮球要一直显示、采样要一直跑，
+            所以同样走 specialUse 前台服务。用户长按悬浮球收掉时服务退场，记录中的
+            那一条会先保存再退。
+        -->
+        <service
+            android:name=".frame.FrameRecordService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="frame_rate_recording_overlay" />
         </service>
 
         <provider
