@@ -109,6 +109,17 @@ public final class BatterySampler {
     /** 充电中才需要看的功率取值状态机，参数沿用监视条那一套 */
     private final PowerTracker powerTracker = new PowerTracker();
 
+    /**
+     * 上一次成功读到的电流绝对值（A），充电读不到时用来「沿用」。
+     *
+     * 只作用在充电场景（见 buildSample）：充电采样密、漏一拍不该归零，否则充入
+     * 电量的积分会系统性偏小。放电不沿用——那段时间本来就不常采，沿用反而会
+     * 把整晚的读数锁在一个旧值上。
+     */
+    private float lastValidCurrentA;
+    /** 充电中已经连着沿用了多少拍，到 CHARGE_CARRY_MAX_TICKS 就不再沿用 */
+    private int chargeCarryTicks;
+
     private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
 
     /** 采样回调，给界面实时刷新用。跑在采样线程上，别在里面碰 UI */
@@ -422,12 +433,49 @@ public final class BatterySampler {
         // 的突变守卫。两边共用同一个类的同一套常量，读数才不会对不上。
         boolean charging = plugged != 0
                 && s.status != BatteryManager.BATTERY_STATUS_DISCHARGING;
+        if (!charging) {
+            // 拔电就把沿用计数归零：沿用窗口只服务「这一次充电」，不该跨会话累计。
+            // lastValidCurrentA 不在这里清——它会在下一次读到有效值或第一次沿用后
+            // 自然被覆盖，清不清对结果没影响，留着反而能桥接插拔瞬间那一拍
+            chargeCarryTicks = 0;
+        }
         float currentA = readCurrentA(intent);
-        float magnitudeMa = currentA * 1000f;
+        // readCurrentA 四条路全失败时返回的是 0，这个 0 是「读不到」的意思，
+        // 不是「电流真的是 0」。必须把两者分开，否则 0 会被原样落库、当成测量值。
+        boolean currentFresh = currentA > 0f;
+
+        // 充电中延长「沿用窗口」：读不到就沿用上次有效电流，别几拍就归零。
+        // 充电采样间隔默认 15 秒，PowerTracker 里放电用的 STALE_MAX_TICKS(5) 只顶
+        // 75 秒，快充时电流节点连续抖动超过 5 拍就会落一串 0，充入电量的积分
+        // （Σ I·dt）因此系统性偏小——容量反推跟着偏小就是这么来的。
+        // 沿用有明确上限（CHARGE_CARRY_MAX_TICKS），且下方落库时标成「非本拍实测」。
+        float effCurrentA = currentA;
+        boolean carriedCurrent = false;
+        if (currentFresh) {
+            lastValidCurrentA = currentA;
+            chargeCarryTicks = 0;
+        } else if (charging && lastValidCurrentA > 0f
+                && chargeCarryTicks < Constants.Battery.CHARGE_CARRY_MAX_TICKS) {
+            effCurrentA = lastValidCurrentA;
+            carriedCurrent = true;
+            chargeCarryTicks++;
+        }
+
+        float magnitudeMa = effCurrentA * 1000f;
         s.currentMa = Math.round(charging ? magnitudeMa : -magnitudeMa);
 
-        float powerW = powerTracker.resolve(currentA, voltageV, this::readPowerNowW);
+        // 功率状态机照走（沿用值也过一遍，保证突变守卫对它是连续的）
+        float powerW = powerTracker.resolve(effCurrentA, voltageV, this::readPowerNowW);
         s.powerW = charging ? powerW : -powerW;
+
+        // power_known：这一拍的功率/电流是不是**本拍真读到**的。
+        // 读不到、被区间拒掉、沿用旧值都记 false：
+        // - 曲线据此把该点用相邻有效值桥接，不画假 0、也不留空洞（见 ui/StatsScreen.kt）；
+        // - 聚合据此把非实测点从平均功率/峰值功率里剔除，不再把假 0 算进平均。
+        // 注意：沿用值仍然写进了 power_w/current_ma（充电积分类继续用它），
+        // 只是打了「非实测」的标记，数据仍可追溯到采样时刻。
+        s.powerKnown = currentFresh
+                || (!carriedCurrent && powerTracker.lastWasFresh());
 
         s.fgPkg = readForegroundPackage(screenOn, charging);
         return s;

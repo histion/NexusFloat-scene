@@ -53,6 +53,17 @@ public final class StatsStore extends SQLiteOpenHelper {
             "id,start_ts,end_ts,start_level,end_level,drain_mah,avg_power_w,"
                     + "screen_on_ms,total_ms,view_ms,sample_count,ongoing";
 
+    /**
+     * samples 表的列清单。readSample 是按**列序号**取值的（getLong(0)、getFloat(5)…），
+     * 一旦哪条 SELECT 少写或多写一列，取出来的就是错位的数字，而且不会报错。
+     * 让所有查询共用同一份清单，加列时只需要改这里 + readSample 一处。
+     *
+     * power_known 放在 power_w 后面、temp_c 前面，与 onCreate 的建表顺序一致。
+     */
+    private static final String SAMPLE_COLUMNS =
+            "ts,dt_ms,level,voltage_mv,current_ma,power_w,power_known,temp_c,status,plugged,"
+                    + "screen_on,fg_pkg";
+
     private static volatile StatsStore sInstance;
 
     private StatsStore(Context context) {
@@ -86,6 +97,10 @@ public final class StatsStore extends SQLiteOpenHelper {
                 // 不信任内核 current_now 的符号约定（各家相反）
                 + "current_ma INTEGER NOT NULL DEFAULT 0,"
                 + "power_w REAL NOT NULL DEFAULT 0,"
+                // 这一拍的功率/电流是不是「本拍真读到的」：1=是，0=读不到或被区间拒掉
+                // （沿用值也算 0）。见 Sample#powerKnown 与 BatterySampler。
+                // v2 新增：老库由 onUpgrade 补这一列。
+                + "power_known INTEGER NOT NULL DEFAULT 1,"
                 + "temp_c REAL NOT NULL DEFAULT 0,"
                 + "status INTEGER NOT NULL DEFAULT 1,"
                 + "plugged INTEGER NOT NULL DEFAULT 0,"
@@ -135,8 +150,42 @@ public final class StatsStore extends SQLiteOpenHelper {
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        // v1 是首版，还没有需要迁移的旧结构。以后加列再在这里补 ALTER TABLE
         LogUtils.i(TAG + " upgrade " + oldVersion + " -> " + newVersion);
+        // v1 -> v2：samples 增加 power_known 列，用来区分「真 0」与「读不到/沿用值」。
+        //
+        // 幂等：先 PRAGMA 查一遍列是否已存在再加。onCreate 建出来的新库本来就有这一列，
+        // 而升级路径里也可能因为各种原因被调用多次，直接 ALTER 会抛 duplicate column。
+        if (oldVersion < 2 && !hasColumn(db, T_SAMPLES, "power_known")) {
+            db.execSQL("ALTER TABLE " + T_SAMPLES
+                    + " ADD COLUMN power_known INTEGER NOT NULL DEFAULT 1");
+            // 历史行里的 power_w=0 分不出「真 0」还是「当时读不到」，但这次修的正是
+            // 「读不到被当成 0 落库」——把它们标成未知（0）。否则用户**正在进行**的
+            // 这次充电，平均值仍会被升级前已经落库的那些假 0 拖低，修了等于没修。
+            // 真 0（涓流/待机时电流就是 0）被一起排除也不影响：它们本来对平均功率
+            // 就没什么贡献，剔掉只会让数字更接近真实。
+            db.execSQL("UPDATE " + T_SAMPLES + " SET power_known=0 WHERE power_w=0");
+        }
+    }
+
+    /** 表里有没有这一列。PRAGMA table_info 是只读查询，代价可以忽略 */
+    private static boolean hasColumn(SQLiteDatabase db, String table, String column) {
+        Cursor c = null;
+        try {
+            c = db.rawQuery("PRAGMA table_info(" + table + ")", null);
+            int nameIdx = c.getColumnIndex("name");
+            while (c.moveToNext()) {
+                if (column.equalsIgnoreCase(c.getString(nameIdx))) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            LogUtils.w(TAG + " hasColumn failed", t);
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return false;
     }
 
     // ======================= 模型 =======================
@@ -151,6 +200,14 @@ public final class StatsStore extends SQLiteOpenHelper {
         public int currentMa;
         /** 带符号 W */
         public float powerW;
+        /**
+         * 这一拍的 current/power 是不是**本拍真读到**的。
+         *
+         * false = 电流/功率读不到、被区间拒掉、或充电中沿用了上次有效值。默认 true，
+         * 让没有显式赋值的调用方（测试、老代码路径）保持「已知」的语义。
+         * 曲线据此把非实测点桥接起来、聚合据此把它们从平均/峰值里剔除。
+         */
+        public boolean powerKnown = true;
         public float tempC;
         public int status;
         public int plugged;
@@ -368,6 +425,7 @@ public final class StatsStore extends SQLiteOpenHelper {
             cv.put("voltage_mv", s.voltageMv);
             cv.put("current_ma", s.currentMa);
             cv.put("power_w", s.powerW);
+            cv.put("power_known", s.powerKnown ? 1 : 0);
             cv.put("temp_c", s.tempC);
             cv.put("status", s.status);
             cv.put("plugged", s.plugged);
@@ -388,8 +446,7 @@ public final class StatsStore extends SQLiteOpenHelper {
         List<Sample> out = new ArrayList<>();
         try {
             Cursor c = getReadableDatabase().rawQuery(
-                    "SELECT ts,dt_ms,level,voltage_mv,current_ma,power_w,temp_c,status,plugged,"
-                            + "screen_on,fg_pkg FROM " + T_SAMPLES
+                    "SELECT " + SAMPLE_COLUMNS + " FROM " + T_SAMPLES
                             + " WHERE ts>=? AND ts<=? ORDER BY ts ASC",
                     new String[]{String.valueOf(fromTs), String.valueOf(toTs)});
             while (c.moveToNext()) {
@@ -439,8 +496,7 @@ public final class StatsStore extends SQLiteOpenHelper {
                 args = new String[]{String.valueOf(fromTs), String.valueOf(toTs)};
             }
             Cursor c = getReadableDatabase().rawQuery(
-                    "SELECT ts,dt_ms,level,voltage_mv,current_ma,power_w,temp_c,status,plugged,"
-                            + "screen_on,fg_pkg FROM " + T_SAMPLES
+                    "SELECT " + SAMPLE_COLUMNS + " FROM " + T_SAMPLES
                             + " WHERE " + where + " ORDER BY ts ASC", args);
             while (c.moveToNext()) {
                 out.add(readSample(c));
@@ -469,8 +525,7 @@ public final class StatsStore extends SQLiteOpenHelper {
     private Sample queryBoundarySample(long fromTs, long toTs, boolean ascending) {
         try {
             Cursor c = getReadableDatabase().rawQuery(
-                    "SELECT ts,dt_ms,level,voltage_mv,current_ma,power_w,temp_c,status,plugged,"
-                            + "screen_on,fg_pkg FROM " + T_SAMPLES + " WHERE ts>=? AND ts<=?"
+                    "SELECT " + SAMPLE_COLUMNS + " FROM " + T_SAMPLES + " WHERE ts>=? AND ts<=?"
                             + " ORDER BY ts " + (ascending ? "ASC" : "DESC") + " LIMIT 1",
                     new String[]{String.valueOf(fromTs), String.valueOf(toTs)});
             Sample s = c.moveToFirst() ? readSample(c) : null;
@@ -514,11 +569,12 @@ public final class StatsStore extends SQLiteOpenHelper {
         s.voltageMv = c.getInt(3);
         s.currentMa = c.getInt(4);
         s.powerW = c.getFloat(5);
-        s.tempC = c.getFloat(6);
-        s.status = c.getInt(7);
-        s.plugged = c.getInt(8);
-        s.screenOn = c.getInt(9) != 0;
-        s.fgPkg = c.isNull(10) ? null : c.getString(10);
+        s.powerKnown = c.getInt(6) != 0;
+        s.tempC = c.getFloat(7);
+        s.status = c.getInt(8);
+        s.plugged = c.getInt(9);
+        s.screenOn = c.getInt(10) != 0;
+        s.fgPkg = c.isNull(11) ? null : c.getString(11);
         return s;
     }
 
@@ -845,6 +901,11 @@ public final class StatsStore extends SQLiteOpenHelper {
      *
      * charging 为 true 时只累加充入方向（current_ma &gt; 0），否则只累加放出方向。
      * 一次充电过程里偶发的负电流（瞬态）不该倒扣充入电量。
+     *
+     * 平均/峰值功率只统计 power_known=1 的点，平均按 dt_ms 加权：
+     * 老的 AVG(power_w) 会把「读不到被落成 0」的假 0 也算进去，平均功率被系统性
+     * 拉低（用户反馈 20.3W 明显低于电量上升速度隐含的 ~40W 就是这么来的）；
+     * 按 dt_ms 加权则是因为采样间隔可调、进程休眠也会让实际间隔对不上设定值。
      */
     private Aggregate aggregate(long fromTs, long toTs, boolean charging) {
         Aggregate agg = new Aggregate();
@@ -852,7 +913,9 @@ public final class StatsStore extends SQLiteOpenHelper {
             String sign = charging ? ">0" : "<0";
             String sql = "SELECT COUNT(*),"
                     + "COALESCE(SUM(CASE WHEN current_ma" + sign + " THEN current_ma*dt_ms ELSE 0 END),0),"
-                    + "COALESCE(AVG(power_w),0),COALESCE(MAX(ABS(power_w)),0),"
+                    + "COALESCE(SUM(CASE WHEN power_known=1 THEN ABS(power_w)*dt_ms ELSE 0 END),0),"
+                    + "COALESCE(SUM(CASE WHEN power_known=1 THEN dt_ms ELSE 0 END),0),"
+                    + "COALESCE(MAX(CASE WHEN power_known=1 THEN ABS(power_w) ELSE 0 END),0),"
                     + "COALESCE(AVG(temp_c),0),COALESCE(MAX(temp_c),0),"
                     + "COALESCE(SUM(CASE WHEN screen_on=1 THEN dt_ms ELSE 0 END),0)"
                     + " FROM " + T_SAMPLES + " WHERE ts>=? AND ts<=?";
@@ -863,7 +926,11 @@ public final class StatsStore extends SQLiteOpenHelper {
                 agg.count = c.getInt(idx++);
                 // 电流单位是 mA、时间单位是 ms，除 3.6e6 得 mAh
                 agg.chargedMah = (float) Math.abs(c.getDouble(idx++) / 3_600_000d);
-                agg.avgPowerW = Math.abs(c.getFloat(idx++));
+                double powerWeighted = c.getDouble(idx++);
+                long powerWeightDt = c.getLong(idx++);
+                agg.avgPowerW = powerWeightDt > 0
+                        ? (float) (powerWeighted / powerWeightDt)
+                        : 0f;
                 agg.peakPowerW = c.getFloat(idx++);
                 agg.avgTempC = c.getFloat(idx++);
                 agg.peakTempC = c.getFloat(idx++);
@@ -885,6 +952,9 @@ public final class StatsStore extends SQLiteOpenHelper {
      *
      * 平均功率同样只算这个应用在前台的那些点。取绝对值是因为放电期间的 power_w
      * 在库里是负的（符号表示方向），而这里要的是「功率多大」。
+     *
+     * v8.8.9.4：平均功率从 AVG(ABS(power_w)) 改成「按 dt_ms 加权、只算 power_known=1」，
+     * 口径跟会话/周期汇总（aggregate）一致——假 0 不参与，采样间隔变化也不影响。
      */
     public List<AppUsage> queryAppUsage(long fromTs, long toTs) {
         Map<String, AppUsage> map = new HashMap<>();
@@ -892,7 +962,8 @@ public final class StatsStore extends SQLiteOpenHelper {
             String sql = "SELECT fg_pkg,"
                     + "SUM(dt_ms),"
                     + "SUM(CASE WHEN current_ma<0 THEN -current_ma*dt_ms ELSE 0 END),"
-                    + "AVG(ABS(power_w))"
+                    + "SUM(CASE WHEN power_known=1 THEN ABS(power_w)*dt_ms ELSE 0 END),"
+                    + "SUM(CASE WHEN power_known=1 THEN dt_ms ELSE 0 END)"
                     + " FROM " + T_SAMPLES
                     + " WHERE ts>=? AND ts<=? AND fg_pkg IS NOT NULL AND fg_pkg<>''"
                     + " GROUP BY fg_pkg";
@@ -905,7 +976,11 @@ public final class StatsStore extends SQLiteOpenHelper {
                 }
                 long fgMs = c.getLong(1);
                 float mah = (float) Math.abs(c.getDouble(2) / 3_600_000d);
-                float avgPowerW = Math.abs(c.getFloat(3));
+                double powerWeighted = c.getDouble(3);
+                long powerWeightDt = c.getLong(4);
+                float avgPowerW = powerWeightDt > 0
+                        ? (float) (powerWeighted / powerWeightDt)
+                        : 0f;
                 map.put(pkg, new AppUsage(pkg, fgMs, mah, avgPowerW));
             }
             c.close();

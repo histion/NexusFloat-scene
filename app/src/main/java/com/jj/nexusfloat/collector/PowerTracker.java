@@ -39,6 +39,14 @@ public final class PowerTracker {
     private int spikeTicks;
 
     /**
+     * 上一次 {@link #resolve} 返回的是不是**本拍新读到/新算出**的值。
+     *
+     * false 表示返回的是沿用的旧值（尖峰守卫/陈旧互顶）或者彻底读不到（0）。
+     * 统计侧据此决定这个采样点要不要标成「未知」——监视条不关心，它只看数字。
+     */
+    private boolean lastFresh;
+
+    /**
      * 按优先级选出这一轮用哪个功率值。
      *
      * currentA 是电流绝对值（A），读不到就传 0；voltageV 是电压。
@@ -58,6 +66,7 @@ public final class PowerTracker {
             // 疑似尖峰就先沿用上次有效值，连着好几拍都这么大才当成真变化
             if (isSpike(power)) {
                 if (++spikeTicks < Constants.Battery.POWER_SPIKE_CONFIRM_TICKS) {
+                    lastFresh = false;
                     return lastValid;
                 }
                 // 连着确认了：接受这个新水平，计数清零
@@ -67,15 +76,27 @@ public final class PowerTracker {
             }
             lastValid = power;
             staleTicks = 0;
+            lastFresh = true;
             return power;
         }
 
         if (staleTicks < Constants.Battery.STALE_MAX_TICKS) {
             staleTicks++;
+            lastFresh = false;
             return lastValid;
         }
         lastValid = 0f;
+        lastFresh = false;
         return 0f;
+    }
+
+    /**
+     * 上一次 {@link #resolve} 返回的是不是本拍新读到的值。
+     *
+     * 必须在每次 resolve 之后立刻读，它反映的是「最近一次调用」的结果。
+     */
+    public boolean lastWasFresh() {
+        return lastFresh;
     }
 
     /**

@@ -32,6 +32,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -119,6 +120,15 @@ fun StatsScreen(
     var detailSessionId by remember { mutableStateOf(0L) }
     var detailPeriodId by remember { mutableStateOf(0L) }
     val detailOpen = detailSessionId > 0L || detailPeriodId > 0L
+
+    /**
+     * 当前看的是哪个模块：0=充电统计，1=使用统计。
+     *
+     * 用 rememberSaveable 存，退出统计页再回来（或者旋屏/进程重建）还停在原来那一栏，
+     * 不会每次都弹回充电统计。切换时调 onRequestScrollTop() 把整页滚回顶部——
+     * 两个模块都是长列表，切过去还停在上一栏的滚动位置会像内容错位。
+     */
+    var section by rememberSaveable { mutableStateOf(0) }
 
     val closeDetail = {
         detailSessionId = 0L
@@ -250,89 +260,131 @@ fun StatsScreen(
     val now = System.currentTimeMillis()
     val capacity = data.capacityMah
 
+    // 「当前状态」两个模块都要看（电池是充电和放电共用的那一份实时读数），
+    // 所以留在最上面，不进分段。
     CurrentStatusCard(data)
 
-    // 充电卡：优先展示正在进行的会话，没有就退回最近一次记录
-    val shownSession = data.currentSession ?: data.sessionHistory.firstOrNull()
-    ChargeCard(
-        session = shownSession,
-        curve = data.chargeCurve,
-        capacityMah = capacity,
-        now = now
-    )
-
-    // 使用卡：正在进行的放电周期，没有就退回最近一次
-    val shownPeriod = data.currentPeriod ?: data.periodHistory.firstOrNull()
-    UsageCard(
-        period = shownPeriod,
-        curve = data.dischargeCurve,
-        capacityMah = capacity,
-        usagePermission = data.usagePermission,
-        onOpenUsageAccess = onOpenUsageAccess,
-        now = now,
-        fgBuckets = data.fgBuckets,
-        towerBucketCount = data.towerBuckets
-    )
-
-    AppUsageCard(
-        apps = data.apps,
-        drainBaseMah = data.appDrainBaseMah,
-        usagePermission = data.usagePermission,
-        hasPeriod = shownPeriod != null,
-        onOpenUsageAccess = onOpenUsageAccess
-    )
-
-    TotalsCard(data.totals, capacity)
-
-    if (data.sessionHistory.isNotEmpty()) {
-        HistoryCard(
-            sessions = data.sessionHistory,
-            now = now,
-            onOpen = { s ->
-                detailSessionId = s.id
+    // 分段控件：充电统计 / 使用统计。
+    //
+    // 拆成两个模块的理由：这一页原来把「充电」和「使用」十几张卡顺序铺下来，
+    // 想找充电历史得先划过整个使用统计；两件事本来也互不相干（一个只在插电时发生、
+    // 一个只在拔电后发生）。分段之后一次只呈现一件事，符合页面的语义划分。
+    // 设置项也跟着分：开统计/采样间隔/通知/双电芯/清空是**采样器**这套公共设施
+    // （采样器在充电场景下才持锁常跑），放「充电统计」；「仅亮屏时记录」按定义只
+    // 影响不充电时的采样、「使用情况访问」只服务应用榜，放「使用统计」。
+    Spacer(modifier = Modifier.height(12.dp))
+    SegmentedSelector(
+        options = listOf("充电统计", "使用统计"),
+        selectedIndex = section,
+        onSelect = { picked ->
+            if (picked != section) {
+                section = picked
                 onRequestScrollTop()
-            },
-            onDelete = deleteSession
+            }
+        }
+    )
+    Spacer(modifier = Modifier.height(12.dp))
+
+    if (section == 0) {
+        // ================= 充电统计 =================
+        // 本次充电卡（电量—功率曲线 + 电池温度曲线）
+        val shownSession = data.currentSession ?: data.sessionHistory.firstOrNull()
+        ChargeCard(
+            session = shownSession,
+            curve = data.chargeCurve,
+            capacityMah = capacity,
+            now = now
+        )
+
+        // 充电记录历史（可点进详情、可删/重置）
+        if (data.sessionHistory.isNotEmpty()) {
+            HistoryCard(
+                sessions = data.sessionHistory,
+                now = now,
+                onOpen = { s ->
+                    detailSessionId = s.id
+                    onRequestScrollTop()
+                },
+                onDelete = deleteSession
+            )
+        }
+
+        // 累计充电（原「累计统计」里属于充电的那一半）
+        ChargeTotalsCard(data.totals)
+
+        // 充电统计设置（开统计 / 采样间隔 / 通知 / 双电芯 / 电流诊断 / 清空）
+        ChargeSettingsCard(
+            statsEnabled = statsEnabled,
+            onStatsEnabledChange = onStatsEnabledChange,
+            intervalSec = intervalSec,
+            onIntervalChange = onIntervalChange,
+            notificationEnabled = notificationEnabled,
+            onNotificationChange = onNotificationChange,
+            dualCellEnabled = dualCellEnabled,
+            onDualCellChange = onDualCellChange,
+            sampleCount = data.sampleCount,
+            onClearData = onClearData,
+            currentSource = data.currentSource
+        )
+    } else {
+        // ================= 使用统计 =================
+        // 本次使用卡（使用过程曲线 + 应用图标塔）
+        val shownPeriod = data.currentPeriod ?: data.periodHistory.firstOrNull()
+        UsageCard(
+            period = shownPeriod,
+            curve = data.dischargeCurve,
+            capacityMah = capacity,
+            usagePermission = data.usagePermission,
+            onOpenUsageAccess = onOpenUsageAccess,
+            now = now,
+            fgBuckets = data.fgBuckets,
+            towerBucketCount = data.towerBuckets
+        )
+
+        // 应用使用情况榜
+        AppUsageCard(
+            apps = data.apps,
+            drainBaseMah = data.appDrainBaseMah,
+            usagePermission = data.usagePermission,
+            hasPeriod = shownPeriod != null,
+            onOpenUsageAccess = onOpenUsageAccess
+        )
+
+        // 使用周期历史
+        if (data.periodHistory.isNotEmpty()) {
+            PeriodHistoryCard(
+                periods = data.periodHistory,
+                now = now,
+                onOpen = { p ->
+                    detailPeriodId = p.id
+                    onRequestScrollTop()
+                },
+                onDelete = deletePeriod
+            )
+        }
+
+        // 累计使用（原「累计统计」里属于使用的那一半）
+        UsageTotalsCard(data.totals, capacity)
+
+        // 使用统计设置（仅亮屏时记录 / 使用情况访问）
+        UsageSettingsCard(
+            screenOnOnly = screenOnOnly,
+            onScreenOnOnlyChange = onScreenOnOnlyChange,
+            // 充电中这个开关会自动显示成「关」并置灰，拔电后恢复用户原本的选择。
+            // 恢复不需要额外做什么——用户存下来的值从头到尾没被改写
+            charging = chargingNow,
+            usagePermission = data.usagePermission,
+            onOpenUsageAccess = onOpenUsageAccess
         )
     }
 
-    if (data.periodHistory.isNotEmpty()) {
-        PeriodHistoryCard(
-            periods = data.periodHistory,
-            now = now,
-            onOpen = { p ->
-                detailPeriodId = p.id
-                onRequestScrollTop()
-            },
-            onDelete = deletePeriod
-        )
-    }
-
-    StatsSettingsCard(
-        statsEnabled = statsEnabled,
-        onStatsEnabledChange = onStatsEnabledChange,
-        intervalSec = intervalSec,
-        onIntervalChange = onIntervalChange,
-        notificationEnabled = notificationEnabled,
-        onNotificationChange = onNotificationChange,
-        screenOnOnly = screenOnOnly,
-        onScreenOnOnlyChange = onScreenOnOnlyChange,
-        // 充电中这个开关会自动置为「关」，拔电后恢复用户原本的选择。恢复不需要
-        // 额外做什么——用户存下来的值从头到尾没被改写，这里只是「显示成关」
-        charging = chargingNow,
-        dualCellEnabled = dualCellEnabled,
-        onDualCellChange = onDualCellChange,
-        usagePermission = data.usagePermission,
-        onOpenUsageAccess = onOpenUsageAccess,
-        sampleCount = data.sampleCount,
-        onClearData = onClearData,
-        currentSource = data.currentSource
-    )
-
-    Spacer(modifier = Modifier.height(2.dp))
+    // 说明文案留在页尾（两个模块都能看到）。
+    // 它讲的是「数据怎么存的、保留多久、能不能删」——是整页级别的约定，不属于
+    // 充电或使用任何一边，所以不跟着分段走，避免在两处重复一遍同样的字。
+    Spacer(modifier = Modifier.height(12.dp))
     Text(
         text = "统计数据永久存在本机，不联网、不上传。采样明细保留 45 天后自动清理，" +
-                "充电记录与使用周期永久保留；两者都可以在下面的列表里手动删除。",
+                "充电记录与使用周期永久保留；两者都可以在上面的列表里手动删除。",
         fontSize = 10.sp,
         color = MdThemeOnSurfaceVariant,
         modifier = Modifier.padding(horizontal = 6.dp)
@@ -551,11 +603,14 @@ internal fun ChargeCurves(curve: List<StatsStore.Sample>) {
         return
     }
     val levels = curve.map { it.level.toFloat() }
-    val powers = curve.map { Math.abs(it.powerW) }
+    // 功率序列带「未知」语义：power_known=0 的点（读不到 / 被区间拒掉 / 沿用值）
+    // 不画成 0，用相邻有效值桥接，否则曲线会呈现「多数点贴 0、偶尔窜尖峰」的方波
+    val powers = chargePowerSeries(curve)
 
     // 功率轴上限取实际峰值的 1.15 倍并向上取整到 10W，免得曲线贴着顶边；
-    // 右轴刻度每 10W 一条，上限不是 10 的整数倍时最上面那条刻度对不上峰值
-    val peak = powers.maxOrNull() ?: 0f
+    // 右轴刻度每 10W 一条，上限不是 10 的整数倍时最上面那条刻度对不上峰值。
+    // 峰值只取桥接后仍有值的点（= 有效点），未知点不参与
+    val peak = powers.filterNotNull().maxOrNull() ?: 0f
     val powerMax = maxOf(10f, Math.ceil((peak * 1.15f / 10f).toDouble()).toFloat() * 10f)
 
     val times = curve.map { it.ts }
@@ -601,6 +656,39 @@ internal fun ChargeCurves(curve: List<StatsStore.Sample>) {
         xTicks = axisTicks(times, X_TICK_CHARGE_MS),
         xValues = times
     )
+}
+
+/**
+ * 充电功率曲线的取值序列（带「未知」语义）。
+ *
+ * `power_known=0` 的采样点表示这一拍的电流/功率没能真读到（读不到、被合法区间
+ * 拒掉、或者充电中沿用了上次的有效值）。这些点**不能**当成 0 画出来——那正是
+ * 用户看到的「橙线呈方波、多数点贴在 0 上」。规则：
+ *
+ * - 每个未知点用**前一个有效点**的值桥接，折线保持连续，既不留空洞也不画假 0；
+ * - 出现在第一个有效点之前的未知点没有可桥接的对象，返回 null，让折线从第一个
+ *   有效点开始（宁可起点稍晚，也不在开头画一段假的 0）；
+ * - 整段一个有效点都没有（这一段全读不到）时**维持原样**，直接把落库值取绝对值
+ *   画出来，免得曲线整条消失、看着像页面坏了。
+ *
+ * 返回值是 `List<Float?>`，null 会被 LineChart 断开——这是图表本来就支持的能力。
+ */
+internal fun chargePowerSeries(curve: List<StatsStore.Sample>): List<Float?> {
+    if (curve.none { it.powerKnown }) {
+        return curve.map { Math.abs(it.powerW) }
+    }
+    val out = ArrayList<Float?>(curve.size)
+    var last: Float? = null
+    for (s in curve) {
+        if (s.powerKnown) {
+            val v = Math.abs(s.powerW)
+            last = v
+            out.add(v)
+        } else {
+            out.add(last)
+        }
+    }
+    return out
 }
 
 // ======================= 使用周期 =======================
@@ -955,11 +1043,14 @@ private fun AppRow(
 
 // ======================= 汇总 =======================
 
+/**
+ * 「累计充电」卡。原「累计统计」里属于充电的那一半，拆到充电模块下。
+ */
 @Composable
-private fun TotalsCard(totals: StatsStore.Totals, capacityMah: Float) {
-    SectionCard(title = "累计统计") {
-        if (totals.sessionCount == 0 && totals.periodCount == 0) {
-            EmptyHint("还没有足够的记录可以汇总。用上一两天再回来看。")
+private fun ChargeTotalsCard(totals: StatsStore.Totals) {
+    SectionCard(title = "累计充电") {
+        if (totals.sessionCount == 0) {
+            EmptyHint("还没有充电记录可以汇总。用上一两天再回来看。")
             return@SectionCard
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -991,7 +1082,22 @@ private fun TotalsCard(totals: StatsStore.Totals, capacityMah: Float) {
                 modifier = Modifier.weight(1f)
             )
         }
-        Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+/**
+ * 「累计使用」卡。原「累计统计」里属于使用的那一半。
+ *
+ * 容量只用于「平均每小时耗电」这一格的分母（把累计放电换算成百分比），
+ * 反推不出容量时由 capacityOrFallback 给个常见值兜底。
+ */
+@Composable
+private fun UsageTotalsCard(totals: StatsStore.Totals, capacityMah: Float) {
+    SectionCard(title = "累计使用") {
+        if (totals.periodCount == 0) {
+            EmptyHint("还没有使用周期可以汇总。用上一两天再回来看。")
+            return@SectionCard
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             MetricTile(
                 title = "使用周期",
@@ -1257,29 +1363,31 @@ internal fun DeleteChip(armed: Boolean, label: String, onClick: () -> Unit) {
 
 // ======================= 设置 =======================
 
+/**
+ * 「充电统计设置」。
+ *
+ * 这些项都是**采样器**这套公共设施的开关：采样器在充电场景下才持锁常跑
+ * （放电不持锁、只靠定时器），所以「开统计 / 采样间隔 / 常驻通知 / 双电芯 /
+ * 电流来源诊断 / 清空数据」归在充电这一侧。（「双电芯」本质是显示倍率，
+ * 但充电曲线是它最直接的作用面，跟着采样设置一起放。）
+ */
 @Composable
-private fun StatsSettingsCard(
+private fun ChargeSettingsCard(
     statsEnabled: Boolean,
     onStatsEnabledChange: (Boolean) -> Unit,
     intervalSec: Int,
     onIntervalChange: (Int) -> Unit,
     notificationEnabled: Boolean,
     onNotificationChange: (Boolean) -> Unit,
-    screenOnOnly: Boolean,
-    onScreenOnOnlyChange: (Boolean) -> Unit,
-    /** 当前是否插着电；插着电时「仅亮屏时记录」自动关闭并置灰 */
-    charging: Boolean,
     dualCellEnabled: Boolean,
     onDualCellChange: (Boolean) -> Unit,
-    usagePermission: Boolean,
-    onOpenUsageAccess: () -> Unit,
     sampleCount: Int,
     onClearData: () -> Unit,
     currentSource: String?
 ) {
     var confirmClear by remember { mutableStateOf(false) }
 
-    SectionCard(title = "统计设置") {
+    SectionCard(title = "充电统计设置") {
         ToggleRow(
             label = "开启统计",
             checked = statsEnabled,
@@ -1303,31 +1411,6 @@ private fun StatsSettingsCard(
             onCheckedChange = onNotificationChange,
             description = "关掉只是不显示；前台服务本身需要它保活"
         )
-        Spacer(modifier = Modifier.height(8.dp))
-        // 「仅亮屏时记录」在充电期间自动关闭（v8.8.9.3）。
-        //
-        // 理由：插着电本来就谈不上省电，而这个开关开着会让整夜充电的曲线只剩零星
-        // 几个点（采样侧同样把充电排除在外，见 BatterySampler#skipByScreenOnly）。
-        // 这里是把那条规则**显示出来**：充电中这一行显示成「关」且不可点，副标题
-        // 说明拔电后会自动恢复。
-        //
-        // 恢复不需要额外做什么——用户存下来的值从头到尾没被改写。真去「先存原值、
-        // 改掉、充电完再写回来」的话，进程一旦在充电中途被杀，用户的选择就永久丢了。
-        ToggleRow(
-            label = "仅亮屏时记录",
-            checked = screenOnOnly && !charging,
-            onCheckedChange = onScreenOnOnlyChange,
-            enabled = !charging,
-            description = if (charging) {
-                if (screenOnOnly) {
-                    "充电中已自动关闭（插着电本来就全量记录），拔电后恢复为「开」"
-                } else {
-                    "充电中不适用（插着电本来就全量记录）"
-                }
-            } else {
-                "更省电，但息屏期间的电量曲线会断开"
-            }
-        )
         // 双电芯跟监视条共用同一个开关（读写的是同一个 prefs 键），
         // 拨完这一页的数字立刻翻倍/减半，悬浮窗那边下一拍也会跟着变
         Spacer(modifier = Modifier.height(8.dp))
@@ -1336,17 +1419,6 @@ private fun StatsSettingsCard(
             checked = dualCellEnabled,
             onCheckedChange = onDualCellChange,
             description = "功率/电流只有悬浮窗的一半时开启；与「监视项目」页的开关是同一个"
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        ToggleRow(
-            label = "使用情况访问",
-            checked = usagePermission,
-            onCheckedChange = { onOpenUsageAccess() },
-            description = if (usagePermission) {
-                "已授权，应用时长取自系统记录"
-            } else {
-                "点此前往系统设置授权，可让应用时长统计更精确"
-            }
         )
 
         // 电流取数诊断。机型差异太大（联发科 HAL 常常不实现 CURRENT_NOW），
@@ -1394,6 +1466,63 @@ private fun StatsSettingsCard(
                 )
             }
         }
+    }
+}
+
+/**
+ * 「使用统计设置」。
+ *
+ * 这两个开关按定义都只影响**不充电时**的统计：
+ * - 「仅亮屏时记录」：只在没插电时决定要不要跳过着点；充电期间恒不跳过（见
+ *   BatterySampler#skipByScreenOnly），所以界面上充电时会显示成「关」且置灰。
+ * - 「使用情况访问」：只服务应用使用榜（前台时长的精确来源），充电场景用不到。
+ * 所以放在使用统计这一侧，跟它们真正影响的卡片挨在一起。
+ */
+@Composable
+private fun UsageSettingsCard(
+    screenOnOnly: Boolean,
+    onScreenOnOnlyChange: (Boolean) -> Unit,
+    /** 当前是否插着电；插着电时「仅亮屏时记录」自动关闭并置灰 */
+    charging: Boolean,
+    usagePermission: Boolean,
+    onOpenUsageAccess: () -> Unit
+) {
+    SectionCard(title = "使用统计设置") {
+        // 「仅亮屏时记录」在充电期间自动关闭（v8.8.9.3）。
+        //
+        // 理由：插着电本来就谈不上省电，而这个开关开着会让整夜充电的曲线只剩零星
+        // 几个点（采样侧同样把充电排除在外，见 BatterySampler#skipByScreenOnly）。
+        // 这里是把那条规则**显示出来**：充电中这一行显示成「关」且不可点，副标题
+        // 说明拔电后会自动恢复。
+        //
+        // 恢复不需要额外做什么——用户存下来的值从头到尾没被改写。真去「先存原值、
+        // 改掉、充电完再写回来」的话，进程一旦在充电中途被杀，用户的选择就永久丢了。
+        ToggleRow(
+            label = "仅亮屏时记录",
+            checked = screenOnOnly && !charging,
+            onCheckedChange = onScreenOnOnlyChange,
+            enabled = !charging,
+            description = if (charging) {
+                if (screenOnOnly) {
+                    "充电中已自动关闭（插着电本来就全量记录），拔电后恢复为「开」"
+                } else {
+                    "充电中不适用（插着电本来就全量记录）"
+                }
+            } else {
+                "更省电，但息屏期间的电量曲线会断开"
+            }
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        ToggleRow(
+            label = "使用情况访问",
+            checked = usagePermission,
+            onCheckedChange = { onOpenUsageAccess() },
+            description = if (usagePermission) {
+                "已授权，应用时长取自系统记录"
+            } else {
+                "点此前往系统设置授权，可让应用时长统计更精确"
+            }
+        )
     }
 }
 

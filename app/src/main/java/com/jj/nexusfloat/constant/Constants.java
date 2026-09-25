@@ -1558,14 +1558,22 @@ public final class Constants {
         /**
          * 合理电流区间（A）。区间上下限之比小于 1000，这样 µA 和 mA 两种解释的
          * 原始数值区间不会重叠，单位判定就是唯一的：
-         * µA 要 X∈[5e4,2e7]，mA 要 X∈[50,2e4]。
+         * µA 要 X∈[5e4,4e7]，mA 要 X∈[50,4e4]。
          *
-         * v1.8.10：上限从 20A 收紧到 12A——手机单电芯充电电流极少超过 12A
-         * （120W 快充也多在 10A 上下），20A 太宽会让节点偶发的大值通过校验，
-         * 表现就是「0.5W 突然跳到 60W」。
+         * v1.8.10 曾把上限从 20A 收紧到 12A，理由是「单电芯极少超过 12A」。但实测
+         * 反馈证明这条太紧：`SysfsReader.parseScaled` 对超出 [min,max] 的读数直接返回
+         * 0，于是 12A 以上的真实快充电流被静默判成「没读到」——52.9W@4.4V ≈ 12.0A
+         * 的峰值正好卡在这个上限上，稍高一点的采样全被丢掉，落库是一串 0，曲线就
+         * 呈现「多数点贴 0、偶尔窜一根尖峰」的方波。**这里恢复 20A**（上下限之比
+         * 20/0.05=400，仍远小于 1000，单位判定照旧唯一）。
+         *
+         * 当初收紧是想压掉「0.5W 突然跳到 60W」的偶发大值，但那条现在由
+         * {@link #POWER_SPIKE_RATIO}/{@link #POWER_SPIKE_MIN_DELTA_W} 的突变守卫兜住了
+         * （PowerTracker.resolve），不再需要靠区间上限来砍尖峰——用区间去砍会连带
+         * 砍掉真实快充读数，代价太大。
          */
         public static final float CURRENT_MIN_A = 0.05f;
-        public static final float CURRENT_MAX_A = 12f;
+        public static final float CURRENT_MAX_A = 20f;
         /** 合理电压区间（V），覆盖单/双电芯；同样保证 µV 和 mV 不重叠 */
         public static final float VOLTAGE_MIN_V = 2.5f;
         public static final float VOLTAGE_MAX_V = 20f;
@@ -1581,6 +1589,21 @@ public final class Constants {
          * 屏幕上就留着一个永不变化的数字，反而比显示 0 更误导。
          */
         public static final int STALE_MAX_TICKS = 5;
+
+        /**
+         * 充电中「沿用上次有效读数」的最大轮数（1 轮 = 一次充电采样）。
+         *
+         * 放电时沿用 {@link #STALE_MAX_TICKS}(5) 就够：读不到就是读不到，早点归零
+         * 反而干净。但充电不允许这么短——充电采样间隔默认 15 秒，5 拍只顶 75 秒，
+         * 而快充时电流节点常常连续若干拍读不到（内核更新慢、HAL 抖动）。一归零就落
+         * 一串 0，充入电量的电流积分（Σ I·dt）会系统性偏小——这正是用户反馈里
+         * 「充入 1294 mAh、反推容量才 1875 mAh」的直接原因之一。
+         *
+         * 40 拍 @15 秒 ≈ 10 分钟：足够桥过一次快充过程中的读取抖动，又有明确上限，
+         * 不会像「无限沿用」那样把数值永久锁死在一个假读数上。沿用的点落库时会
+         * 标成「非本拍实测」（samples.power_known=0），聚合与曲线都能把它区分出来。
+         */
+        public static final int CHARGE_CARRY_MAX_TICKS = 40;
 
         /**
          * power_now 连续上报同一个数值多少轮之后就判定为静态值，永久弃用。
@@ -1860,7 +1883,13 @@ public final class Constants {
         // ---- 数据库 ----
 
         public static final String DB_NAME = "nexus_stats.db";
-        public static final int DB_VERSION = 1;
+        /**
+         * 数据库版本。
+         *
+         * v1 → v2（v8.8.9.4）：samples 增加 power_known 列，区分「真 0」与
+         * 「读不到/沿用值」。迁移逻辑见 StatsStore#onUpgrade（幂等 ALTER TABLE）。
+         */
+        public static final int DB_VERSION = 2;
 
         /**
          * 采样明细保留天数。
