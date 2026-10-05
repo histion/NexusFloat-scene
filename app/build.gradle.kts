@@ -28,8 +28,8 @@ android {
         targetSdk = 37
         // versionCode 只是给系统比大小的，跟 versionName 不必有换算关系；
         // 递增即可，覆盖安装时能正常升级
-        versionCode = 9000005
-        versionName = "9.0.0.5"
+        versionCode = 9000006
+        versionName = "9.0.0.6"
     }
 
     signingConfigs {

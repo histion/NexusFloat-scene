@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.widget.Toast
+import androidx.annotation.DrawableRes
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.BackHandler
@@ -43,9 +44,11 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -2814,10 +2817,17 @@ internal fun MetricTile(
      */
     compact: Boolean = false,
     /**
-     * 标题前的 emoji 图标（如 🧠/📱/🤖），给设备信息这种「一眼看类别」的格子用。
-     * 传 null（默认）就维持原来的纯文字标题，既有调用点完全不受影响。
+     * 标题前的方形 logo（自绘矢量，比如设备信息卡的 CPU / 手机 / 安卓图标）。
+     *
+     * [iconRes] 是「线条」层，运行时会按当前主题的正文色 tint——矢量里画的是纯白，
+     * 直接铺在深色卡片上会很刺眼、深浅两套主题也没法通用。
+     * [iconAccentRes] 是可选「底色」层（品牌色填充），先铺它再把线条层盖上去，
+     * 两层合起来才等于原图。
+     *
+     * 两个都传 null（默认）就维持原来的纯文字标题，既有调用点完全不受影响。
      */
-    icon: String? = null
+    @DrawableRes iconRes: Int? = null,
+    @DrawableRes iconAccentRes: Int? = null
 ) {
     Column(
         modifier = modifier
@@ -2829,12 +2839,26 @@ internal fun MetricTile(
             )
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            if (icon != null) {
-                Text(
-                    text = icon,
-                    fontSize = if (compact) 10.sp else 11.sp,
-                    maxLines = 1
-                )
+            if (iconRes != null) {
+                // logo 占一个正方形，摆在标题左边（原来 emoji 的位置）。
+                // 不放到「标题+数值」整体左侧是有意的：紧凑格只有约 113dp 宽，
+                // 再挤出 22dp 给图标，「SM-S9280」这种机型号就要被省略号吃掉，
+                // 而数值保持整格宽度就不会。
+                Box(modifier = Modifier.size(if (compact) 18.dp else 24.dp)) {
+                    if (iconAccentRes != null) {
+                        Image(
+                            painter = painterResource(iconAccentRes),
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                    Image(
+                        painter = painterResource(iconRes),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        colorFilter = ColorFilter.tint(MdThemeOnSurface)
+                    )
+                }
                 Spacer(modifier = Modifier.width(4.dp))
             }
             Text(
@@ -2921,6 +2945,15 @@ private data class ChangelogEntry(val version: String, val summary: String)
  * shell 内建 read）只在能被观察到时才写进来，那一条的观察点是耗电。
  */
 private val CHANGELOG = listOf(
+    ChangelogEntry(
+        "9.0.0.6",
+        "修复悬浮球在横屏被挪到左 / 右边缘后，转回竖屏找不回来的问题：位置原来存的是" +
+                "像素坐标，横屏存下的坐标落在竖屏画面之外，球就一直贴在屏幕外，看不见也" +
+                "点不到。现在改存相对位置的比例（「贴右边沿、纵向 28%」这种），转屏后按" +
+                "新屏幕重新换算，球会落在对应那一侧的边上；往下拖出屏幕的情况也一起夹住了。" +
+                "设备信息卡的 CPU 型号 / 手机型号 / 安卓版本换了专门画的矢量图标" +
+                "（芯片 / 手机 / 安卓机器人），线条颜色跟着深浅主题走。"
+    ),
     ChangelogEntry(
         "9.0.0.5",
         "帧记录「CPU 占用」换成和顶部悬浮栏同一套算法：逐行容错（一行认不出来只丢这一行）、" +

@@ -52,6 +52,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.jj.nexusfloat.R
 import com.jj.nexusfloat.frame.FrameBubble
 import com.jj.nexusfloat.frame.FrameRecordService
 import com.jj.nexusfloat.frame.FrameRecordStore
@@ -353,21 +354,23 @@ private fun DeviceCard() {
                 value = socModel(),
                 modifier = Modifier.weight(1f),
                 compact = true,
-                icon = "🧠"
+                iconRes = R.drawable.ic_dev_cpu_ink,
+                iconAccentRes = R.drawable.ic_dev_cpu_accent
             )
             MetricTile(
                 title = "手机型号",
                 value = Build.MODEL ?: "未知",
                 modifier = Modifier.weight(1f),
                 compact = true,
-                icon = "📱"
+                iconRes = R.drawable.ic_dev_phone_ink
             )
             MetricTile(
                 title = "安卓版本",
                 value = "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
                 modifier = Modifier.weight(1f),
                 compact = true,
-                icon = "🤖"
+                iconRes = R.drawable.ic_dev_android_ink,
+                iconAccentRes = R.drawable.ic_dev_android_accent
             )
         }
     }

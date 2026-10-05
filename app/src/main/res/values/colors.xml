@@ -17,4 +17,7 @@
     <color name="status_disconnected_bg">#4A1515</color>
 
     <color name="card_stroke">#2B2F3D</color>
+
+    <!-- 启动图标背景层：冷白，衬托前景的蓝色角色立绘 -->
+    <color name="ic_launcher_background">#EEF2F9</color>
 </resources>

@@ -1,15 +1,20 @@
 package com.jj.nexusfloat.frame;
 
 import android.annotation.SuppressLint;
+import android.content.ComponentCallbacks;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.Point;
+import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -35,12 +40,25 @@ import com.jj.nexusfloat.utils.RootShell;
  * 外观：一个圆角长方形（胶囊，44dp 宽 / 22dp 高）。未记录时棕黄
  * （Constants.Frame.BUBBLE_IDLE_COLOR）并写小字 fps，记录中变红、显示实时
  * 帧率整数并带一圈沿矩形描边的闪烁提示环——用户在游戏里瞄一眼就知道还在不在记。
+ *
+ * 坐标存的是**比例**不是像素（v9.0.0.6）：横屏拖到最右边存的是 x=1.0，
+ * 竖屏回来按竖屏的可移动范围换算，球还在右边沿，不会跑到屏幕外。转屏时靠
+ * DisplayManager 的回调重新落位，见 {@link #reposition()}。
  */
 public final class FrameBubble {
 
     private static final String TAG = "FrameBubble";
+    /** 旧版存的绝对像素，只用于读老数据做一次换算 */
     private static final String KEY_X = "frame_bubble_x";
     private static final String KEY_Y = "frame_bubble_y";
+    /** 现在存的比例（0..1，相对可移动范围） */
+    private static final String KEY_FX = "frame_bubble_fx";
+    private static final String KEY_FY = "frame_bubble_fy";
+    /** 没存过位置时的默认点：右侧、纵向 28%，别正好压在游戏血条上 */
+    private static final float DEFAULT_FX = 1f;
+    private static final float DEFAULT_FY = 0.28f;
+    /** 转屏后隔这么多毫秒再补一次落位：个别 ROM 的 DisplayInfo 晚一拍才更新 */
+    private static final long REPOSITION_RETRY_MS = 350;
 
     public interface Callback {
         /** 点按：切换记录状态 */
@@ -55,6 +73,48 @@ public final class FrameBubble {
     private BallView view;
     private Callback callback;
     private boolean showing;
+
+    /** 转屏落位任务：立即来一次，稍后再补一次（个别 ROM 的尺寸晚一拍才更新） */
+    private final Runnable repositionTask = new Runnable() {
+        @Override
+        public void run() {
+            reposition();
+        }
+    };
+
+    /**
+     * 屏幕变了就落位。转屏、折叠屏展开合上都会走这里——悬浮窗是我们自己
+     * addView 的，系统不会替我们把坐标收回屏幕内。
+     */
+    private final DisplayManager.DisplayListener displayListener =
+            new DisplayManager.DisplayListener() {
+                @Override
+                public void onDisplayAdded(int displayId) {
+                }
+
+                @Override
+                public void onDisplayRemoved(int displayId) {
+                }
+
+                @Override
+                public void onDisplayChanged(int displayId) {
+                    main.post(repositionTask);
+                    main.postDelayed(repositionTask, REPOSITION_RETRY_MS);
+                }
+            };
+
+    /** 兜底通道：App 进程收到配置变更时也落一次位 */
+    private final ComponentCallbacks configCallbacks = new ComponentCallbacks() {
+        @Override
+        public void onConfigurationChanged(Configuration newConfig) {
+            main.postDelayed(repositionTask, 120);
+        }
+
+        @Override
+        public void onLowMemory() {
+        }
+    };
+    private boolean listenersOn;
 
     public FrameBubble(Context context) {
         this.context = context.getApplicationContext();
@@ -101,6 +161,7 @@ public final class FrameBubble {
             WindowManager.LayoutParams lp = buildParams();
             windowManager.addView(view, lp);
             showing = true;
+            registerListeners();
         } catch (Throwable t) {
             // 权限被 ROM 收回、或者窗口 token 失效都会走到这儿；
             // 悬浮球失败不该拖垮记录本身，只把状态记下来
@@ -112,6 +173,7 @@ public final class FrameBubble {
 
     public void hide() {
         main.removeCallbacksAndMessages(null);
+        unregisterListeners();
         if (!showing || view == null) {
             showing = false;
             view = null;
@@ -146,37 +208,179 @@ public final class FrameBubble {
 
     private WindowManager.LayoutParams buildParams() {
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                dp(Constants.Frame.BUBBLE_WIDTH_DP),
-                dp(Constants.Frame.BUBBLE_HEIGHT_DP),
+                bubbleW(),
+                bubbleH(),
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
-        int[] pos = loadPosition();
+        int[] pos = positionOnScreen();
         lp.x = pos[0];
         lp.y = pos[1];
         return lp;
     }
 
-    /** 上次停留的位置；没存过就放右侧偏中的位置，别正好压在游戏血条上 */
-    private int[] loadPosition() {
+    /** 显示期间才挂监听：球都没了就不用管屏幕怎么转 */
+    private void registerListeners() {
+        if (listenersOn) {
+            return;
+        }
+        listenersOn = true;
+        try {
+            DisplayManager dm =
+                    (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                dm.registerDisplayListener(displayListener, main);
+            }
+        } catch (Throwable t) {
+            LogUtils.w(TAG + " register display listener failed", t);
+        }
+        try {
+            context.registerComponentCallbacks(configCallbacks);
+        } catch (Throwable t) {
+            LogUtils.w(TAG + " register config callbacks failed", t);
+        }
+    }
+
+    private void unregisterListeners() {
+        if (!listenersOn) {
+            return;
+        }
+        listenersOn = false;
+        try {
+            DisplayManager dm =
+                    (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                dm.unregisterDisplayListener(displayListener);
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            context.unregisterComponentCallbacks(configCallbacks);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 当前屏幕尺寸。
+     *
+     * 不能用 `context.getResources().getDisplayMetrics()`：那是 App 的配置，
+     * 转屏后要等系统把配置推过来才更新，回调里读到的还是旧值。悬浮窗的坐标系
+     * 就是整块屏幕（含状态栏与导航栏），直接问 Display 最准。
+     */
+    private int[] screenSize() {
+        try {
+            DisplayManager dm =
+                    (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+            Display d = dm == null ? null : dm.getDisplay(Display.DEFAULT_DISPLAY);
+            if (d != null) {
+                Point p = new Point();
+                d.getRealSize(p);
+                if (p.x > 0 && p.y > 0) {
+                    return new int[]{p.x, p.y};
+                }
+            }
+        } catch (Throwable t) {
+            LogUtils.w(TAG + " screenSize failed", t);
+        }
+        android.util.DisplayMetrics m = context.getResources().getDisplayMetrics();
+        return new int[]{m.widthPixels, m.heightPixels};
+    }
+
+    /**
+     * 读上次停留的位置，返回「比例」（相对可移动范围）。
+     *
+     * 老版本存的是绝对像素：这里按当前屏幕换算一次，越界的一律贴边——
+     * 升级后第一次打开，横屏时留在屏幕外的球会自动回到可见范围。
+     */
+    private float[] loadFractions(int maxX, int maxY) {
         SharedPreferences p = context.getSharedPreferences(
                 Constants.Remote.PREFS_NAME, Context.MODE_PRIVATE);
-        int[] out = new int[2];
-        out[0] = p.getInt(KEY_X, Integer.MIN_VALUE);
-        out[1] = p.getInt(KEY_Y, Integer.MIN_VALUE);
-        if (out[0] == Integer.MIN_VALUE || out[1] == Integer.MIN_VALUE) {
-            android.util.DisplayMetrics dm = context.getResources().getDisplayMetrics();
-            out[0] = dm.widthPixels - dp(Constants.Frame.BUBBLE_WIDTH_DP) - dp(12);
-            out[1] = (int) (dm.heightPixels * 0.28f);
+        if (p.contains(KEY_FX) && p.contains(KEY_FY)) {
+            return new float[]{
+                    clamp01(p.getFloat(KEY_FX, DEFAULT_FX)),
+                    clamp01(p.getFloat(KEY_FY, DEFAULT_FY))};
         }
-        return out;
+        int oldX = p.getInt(KEY_X, Integer.MIN_VALUE);
+        int oldY = p.getInt(KEY_Y, Integer.MIN_VALUE);
+        if (oldX != Integer.MIN_VALUE && oldY != Integer.MIN_VALUE) {
+            return new float[]{
+                    clamp01(oldX / (float) Math.max(1, maxX)),
+                    clamp01(oldY / (float) Math.max(1, maxY))};
+        }
+        // 没存过：贴右边但留 12dp 边距，纵向 28%
+        float fx = maxX > 0
+                ? Math.max(0f, (maxX - dp(12f)) / (float) maxX)
+                : DEFAULT_FX;
+        return new float[]{fx, DEFAULT_FY};
+    }
+
+    /** 把比例换算成当前屏幕下的像素坐标，并夹进可见范围 */
+    private int[] positionOnScreen() {
+        int[] screen = screenSize();
+        int maxX = Math.max(0, screen[0] - bubbleW());
+        int maxY = Math.max(0, screen[1] - bubbleH());
+        float[] f = loadFractions(maxX, maxY);
+        int x = Math.round(f[0] * maxX);
+        int y = Math.round(f[1] * maxY);
+        return new int[]{
+                Math.max(0, Math.min(maxX, x)),
+                Math.max(0, Math.min(maxY, y))};
+    }
+
+    /**
+     * 屏幕尺寸变了：按比例把球搬回可见范围。
+     *
+     * 横屏拖到最右边存的是 fx=1.0，竖屏回来落到竖屏的右边沿——不用再把手机
+     * 横过来捞球（v9.0.0.6 修的就是这个）。
+     */
+    private void reposition() {
+        if (!showing || view == null) {
+            return;
+        }
+        try {
+            WindowManager.LayoutParams lp =
+                    (WindowManager.LayoutParams) view.getLayoutParams();
+            if (lp == null) {
+                return;
+            }
+            int[] pos = positionOnScreen();
+            if (lp.x == pos[0] && lp.y == pos[1]) {
+                return;
+            }
+            lp.x = pos[0];
+            lp.y = pos[1];
+            windowManager.updateViewLayout(view, lp);
+        } catch (Throwable t) {
+            LogUtils.w(TAG + " reposition failed", t);
+        }
     }
 
     private void savePosition(int x, int y) {
+        int[] screen = screenSize();
+        int maxX = Math.max(1, screen[0] - bubbleW());
+        int maxY = Math.max(1, screen[1] - bubbleH());
+        // 比例是主数据；绝对像素只留给旧版本读，向后兼容
         context.getSharedPreferences(Constants.Remote.PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putInt(KEY_X, x).putInt(KEY_Y, y).apply();
+                .edit()
+                .putFloat(KEY_FX, clamp01(x / (float) maxX))
+                .putFloat(KEY_FY, clamp01(y / (float) maxY))
+                .putInt(KEY_X, x)
+                .putInt(KEY_Y, y)
+                .apply();
+    }
+
+    private int bubbleW() {
+        return dp(Constants.Frame.BUBBLE_WIDTH_DP);
+    }
+
+    private int bubbleH() {
+        return dp(Constants.Frame.BUBBLE_HEIGHT_DP);
+    }
+
+    private static float clamp01(float v) {
+        return v < 0f ? 0f : (v > 1f ? 1f : v);
     }
 
     private int dp(float v) {
@@ -320,7 +524,7 @@ public final class FrameBubble {
                         WindowManager.LayoutParams lp = getWindowParams();
                         if (lp != null) {
                             lp.x = clampX(startX + (int) dx);
-                            lp.y = Math.max(0, startY + (int) dy);
+                            lp.y = clampY(startY + (int) dy);
                             try {
                                 windowManager.updateViewLayout(BallView.this, lp);
                             } catch (Throwable ignored) {
@@ -361,10 +565,34 @@ public final class FrameBubble {
             }
         }
 
+        /**
+         * 转屏时系统会把新配置推给窗口里的 View，顺手把球拉回可见范围。
+         * 真正的兜底是 DisplayManager 的监听，这里只是多一层保险。
+         */
+        @Override
+        protected void onConfigurationChanged(Configuration newConfig) {
+            super.onConfigurationChanged(newConfig);
+            main.postDelayed(repositionTask, 80);
+        }
+
+        private int ballW() {
+            return getWidth() > 0 ? getWidth() : bubbleW();
+        }
+
+        private int ballH() {
+            return getHeight() > 0 ? getHeight() : bubbleH();
+        }
+
         /** 横向别拖出屏幕：左右各留半个球的余量 */
         private int clampX(int x) {
-            int max = getResources().getDisplayMetrics().widthPixels - getWidth();
+            int max = Math.max(0, screenSize()[0] - ballW());
             return Math.max(0, Math.min(max, x));
+        }
+
+        /** 纵向同理。原来只挡了上边，往下拖出屏幕就同样捞不回来了 */
+        private int clampY(int y) {
+            int max = Math.max(0, screenSize()[1] - ballH());
+            return Math.max(0, Math.min(max, y));
         }
     }
 }
