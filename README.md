@@ -6,6 +6,14 @@
 
 ![监视条](docs/monitor-bar.jpg)
 
+App 内「统计」与「帧记录」两个页签的界面：
+
+![统计页 · 充电统计](docs/screen-stats.png)
+
+![统计页 · 使用统计](docs/screen-usage.png)
+
+![帧记录页](docs/screen-frames.png)
+
 跑在独立悬浮窗里，不是状态栏的子 View，所以全屏玩横屏游戏、看视频时它照常显示，
 不用下滑呼出状态栏。竖屏横屏可以分开开关，各项指标各自带开关，关掉的项目不占位置。
 
